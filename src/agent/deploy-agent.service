@@ -1,0 +1,15 @@
+[Unit]
+Description=Deploy agent (GitHub webhook receiver)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/deploy-agent/deploy-agent.py serve
+Restart=always
+RestartSec=3
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

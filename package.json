@@ -1,0 +1,37 @@
+{
+  "name": "vps-manager",
+  "version": "0.1.0",
+  "description": "Desktop control panel for a single Ubuntu VPS: nginx sites, Docker, and GitHub auto-deploys over SSH.",
+  "main": "src/main/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test \"test/*.test.js\"",
+    "dist": "electron-builder --win",
+    "dev": "electronmon .",
+    "test:e2e": "electron test/e2e/app.e2e.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0",
+    "ssh2": "^1.16.0"
+  },
+  "build": {
+    "appId": "local.vpsmanager.app",
+    "productName": "VPS Manager",
+    "npmRebuild": false,
+    "files": [
+      "src/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    }
+  },
+  "devDependencies": {
+    "electron": "^45.3.1",
+    "electron-builder": "^26.18.0",
+    "electronmon": "^2.0.4"
+  }
+}
