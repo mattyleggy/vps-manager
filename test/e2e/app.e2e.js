@@ -23,8 +23,20 @@ const READS = {
 };
 const AGENT_CONFIG = { secret: 's3cret', port: 9321, listen: '127.0.0.1', public_host: 'deploy.example.com', projects: [{ name: 'app', repo: 'me/app', branch: 'master', path: '/opt/apps/app', command: '', auto: true }] };
 const stdins = []; // stdin of each command, same index as ran
-// What the "Deploying now" scan finds: nothing, until a test turns the deploy on.
+// What the "Deployments" scan finds: nothing, until a test turns the deploy on.
 const ACTIVITY = { deploying: false };
+// The whole history.jsonl: two repositories, one project since removed.
+const HISTORY = {
+  total: 4,
+  projects: { app: { repo: 'me/app', branch: 'master' }, blog: { repo: 'me/blog', branch: 'main' } },
+  entries: [
+    { project: 'app', trigger: 'push', commit: 'aaaa1111', message: 'first app deploy', started: 100, finished: 130, code: 0, log: '/var/log/deploy-agent/app/1.log' },
+    { project: 'blog', trigger: 'manual', commit: 'bbbb2222', message: 'blog went wrong', started: 200, finished: 210, code: 1, log: '/var/log/deploy-agent/blog/2.log' },
+    { project: 'old', trigger: 'push', commit: null, message: null, started: 50, finished: 60, code: 0, log: '/var/log/deploy-agent/old/0.log' },
+    { project: 'app', trigger: 'push', commit: 'cccc3333', message: 'second app deploy', started: 300, finished: 320, code: 0, log: '/var/log/deploy-agent/app/3.log' },
+  ],
+  logs: ['/var/log/deploy-agent/app/3.log', '/var/log/deploy-agent/blog/2.log'],
+};
 const activityScan = () => ({
   now: 1000,
   parents: { 10: 1, 11: 10 },
@@ -69,6 +81,8 @@ function answer(line, stdin) {
   if (/python3 -/.test(line)) {
     // the activity scan also reads history.jsonl, so it is matched before the deploy status
     if (stdin.includes("b'DEPLOY_PROJECT='")) return [0, JSON.stringify(activityScan())];
+    // the full deploy history (Deployments screen) also reads history.jsonl
+    if (stdin.includes("'logs': logs")) return [0, JSON.stringify(HISTORY)];
     if (stdin.includes('/proc/meminfo')) return [0, JSON.stringify(READS.system)];
     // the deploy status script also mentions sites-available, so it is matched first
     if (stdin.includes('history.jsonl')) return [0, JSON.stringify(READS.deploy)];
@@ -81,6 +95,7 @@ function answer(line, stdin) {
   if (line.includes('cat /etc/deploy-agent/config.json') || line.includes("config.json'") && !line.includes('.tmp')) return [0, JSON.stringify(AGENT_CONFIG)];
   if (line.includes('ssh-keygen')) return [0, 'ssh-ed25519 AAAATESTKEY deploy-app\n'];
   if (line.includes('.pub') && line.includes('2>/dev/null')) return [1, '']; // "no key for this project yet"
+  if (line.includes('journalctl -u php8.3-fpm')) return [0, 'php8.3-fpm.service: Failed with result exit-code.\n'];
   return [0, ''];
 }
 const isRead = (l) =>
@@ -90,6 +105,7 @@ const isRead = (l) =>
   (l.includes('.pub') && l.includes('2>/dev/null') && !l.includes('ssh-keygen')); // "is there a key yet?"
 const changes = () => ran.filter((l) => !isRead(l));
 
+const shell = { opened: [], typed: '', sizes: [] };
 const { Ssh } = require(src('ssh.js'));
 Ssh.prototype.connect = async function () {
   this.client = {
@@ -108,6 +124,20 @@ Ssh.prototype.connect = async function () {
           stream.emit('close', code);
         });
       cb(null, stream);
+    },
+    // The terminal panel's shell: echoes what is typed, records size changes.
+    shell(opts, cb) {
+      const stream = new EventEmitter();
+      stream.stderr = new EventEmitter();
+      stream.write = (d) => {
+        shell.typed += d;
+        setImmediate(() => stream.emit('data', Buffer.from(`echo:${d}`)));
+      };
+      stream.setWindow = (rows, cols) => shell.sizes.push([cols, rows]);
+      stream.close = () => setImmediate(() => stream.emit('close'));
+      shell.opened.push(opts);
+      cb(null, stream);
+      setImmediate(() => stream.emit('data', Buffer.from('Welcome to Ubuntu\r\ndeploy@test-host:~$ ')));
     },
     end() {},
   };
@@ -160,7 +190,7 @@ app.whenReady().then(async () => {
   // Page-side helpers: find things the way a user would, by their visible text.
   await js(`
     window.t = {
-      btn: (text, scope = document) => [...scope.querySelectorAll('button')].find((b) => b.textContent.trim() === text),
+      btn: (text, scope = document) => [...scope.querySelectorAll('button')].find((b) => b.textContent.trim() === text || b.getAttribute('aria-label') === text),
       nav: (text) => t.btn(text, document.getElementById('nav')).click(),
       modal: () => [...document.querySelectorAll('.modal')].pop(),
       modalText: () => (t.modal() ? t.modal().innerText : ''),
@@ -178,8 +208,8 @@ app.whenReady().then(async () => {
   await js(`window.api.invoke('settings:save', { connection: { host: 'test-host', username: 'deploy', authType: 'agent' } }).then(() => window.api.invoke('conn:connect', {}))`);
   expect('overview loads from the server', await until(`t.view().includes('test-host') && t.view().includes('Ubuntu 24.04 LTS')`), await js(`t.view()`));
 
-  // ---- a real button: Domains -> Disable, cancel then approve
-  await js(`t.nav('Domains & nginx')`);
+  // ---- a real button: Sites -> Disable, cancel then approve
+  await js(`t.nav('Sites')`);
   expect('site list renders', await until(`t.view().includes('example.com') && t.view().includes('http://127.0.0.1:3000')`), await js(`t.view()`));
   await js(`t.btn('Disable').click()`);
   expect('button opens the review dialog', await until(`t.modalText().includes('Disable site example.com')`), await js(`t.modalText()`));
@@ -354,12 +384,17 @@ app.whenReady().then(async () => {
   await js(`(() => { const box = document.querySelector('.composer textarea'); box.value = 'enable example.com'; t.btn('Send').click(); })()`);
   expect('assistant asks in the panel before changing, with the exact command', await until(`t.askText().includes('Enable site example.com') && t.askText().includes('ln -sfn')`), await js(`t.chat() + t.modalText()`));
   expect('the question re-opens a hidden panel and uses no dialog', await js(`!document.getElementById('assistant').classList.contains('hidden') && !t.modal()`));
-  expect('it said what it was about to do first', (await js(`t.chat()`)).includes("I'll enable example.com."));
+  expect('it said what it was about to do first', await until(`t.chat().includes("I'll enable example.com.")`));
   expect('assistant read ran without a dialog; change has not run yet', ran.some((l) => /python3 -/.test(l)) && changes().length === 0, JSON.stringify(changes()));
   await js(`t.btn('Run command', t.ask()).click()`);
   expect('approved assistant change runs', await until(`t.chat().includes('Enabled')`) && changes().length === 1 && /ln -sfn/.test(changes()[0]), JSON.stringify(changes()));
+  await until(`!t.chat().includes('**')`); // the reply is typed out word by word
   const view1 = await js(`t.chat()`);
   expect('transcript shows the message, both steps and the reply', view1.includes('enable example.com') && view1.includes('nginx › list') && view1.includes('Enable site example.com') && view1.includes('Done') && !(await js(`!!t.ask()`)), view1);
+  expect('approved step keeps a collapsed log of what ran', await until(`(() => { const s = document.querySelector('.msg.tool.has-log'); return !!s && !s.querySelector('.tool-log') && !!s.querySelector('.tool-tail'); })()`), await js(`t.chat()`));
+  await js(`document.querySelector('.msg.tool.has-log .tool-row').click()`);
+  expect('clicking the step expands its full log, starting with the command', await js(`(() => { const p = document.querySelector('.msg.tool.has-log.open .tool-log'); return !!p && /^\\$ Link example.com into sites-enabled/m.test(p.textContent); })()`), await js(`(document.querySelector('.tool-log') || {}).textContent`));
+  await js(`document.querySelector('.msg.tool.has-log .tool-row').click()`);
   expect('reply markdown is rendered, not shown raw', (await js(`!!document.querySelector('.msg.assistant strong') && !!document.querySelector('.msg.assistant code')`)) && !view1.includes('**'));
   const listResult = modelRequests[1].messages[2].content[0].content;
   expect('model sees a summary, not raw file contents', listResult.includes('example.com') && !listResult.includes('proxy_pass'), listResult);
@@ -381,6 +416,60 @@ app.whenReady().then(async () => {
   expect('Stop withdraws the open question and runs nothing', (await until(`!t.ask() && t.chat().includes('Stopped.') && !t.btn('Send').classList.contains('hidden')`)) && changes().length === 0, await js(`t.chat()`));
   await js(`(() => { const box = document.querySelector('.composer textarea'); box.value = 'what did I ask first?'; t.btn('Send').click(); })()`);
   expect('later messages carry the earlier conversation', (await until(`t.chat().includes('Still here.')`)) && modelRequests.at(-1).messages[0].content === 'enable example.com' && modelRequests.at(-1).messages.length > 5, JSON.stringify(modelRequests.at(-1).messages.map((m) => m.role)));
+
+  // ---- Server mode: the assistant writes its own shell commands, each one asked about first
+  expect('Agent is the default mode, and the model is told', modelRequests.every((r) => /Mode: Agent/.test(r.system)) && (await js(`document.querySelector('.composer .mode-btn').dataset.mode`)) === 'agent');
+  ran.length = 0;
+  await js(`(() => { document.querySelector('.composer .mode-btn').click(); document.querySelector('.mode-menu [data-mode=server]').click(); })()`);
+  script.push(toolCall('Checking the service log.', 'server_command', { command: 'journalctl -u php8.3-fpm -n 50 --no-pager', purpose: 'Read the php8.3-fpm log', asRoot: true }, 'tu_5'), reply('It failed to start.'));
+  await js(`(() => { const box = document.querySelector('.composer textarea'); box.value = 'why is php down?'; t.btn('Send').click(); })()`);
+  expect('the mode menu closes after picking, and the pill shows Server', await js(`document.querySelector('.mode-menu').classList.contains('hidden') && document.querySelector('.mode-btn').innerText.trim() === 'Server' && document.querySelector('.composer').classList.contains('server')`));
+  await js(`document.head.append(Object.assign(document.createElement('style'), { textContent: '*{animation:none!important;transition:none!important}' })); document.querySelector('.composer .mode-btn').click(); 0`);
+  await wait(500); const img = (await wc.capturePage()).toPNG(); fs.writeFileSync('C:/Users/Matt/AppData/Local/Temp/claude/5dea572f1e40641d/75f12b94-02d7-473d-b216-4c86ba3963ca/scratchpad/menu.png', img);
+  await js(`document.querySelector('.composer .mode-btn').click(); 0`);
+  expect('a server command is shown in the panel before it runs', await until(`t.askText().includes('Read the php8.3-fpm log') && t.askText().includes('journalctl -u php8.3-fpm -n 50 --no-pager')`), await js(`t.chat()`));
+  expect('nothing ran before Run', !ran.some((l) => l.includes('journalctl')), JSON.stringify(ran));
+  await js(`t.btn('Run command', t.ask()).click()`);
+  expect('approved: it runs as root and the model gets the output', (await until(`t.chat().includes('It failed to start.')`)) && ran.some((l) => l.startsWith('sudo -n bash -c ') && l.includes('journalctl -u php8.3-fpm')) && /Failed with result/.test(modelRequests.at(-1).messages.at(-1).content[0].content), JSON.stringify([ran, modelRequests.at(-1).messages.at(-1)]));
+  expect('the request was made in Server mode', /Mode: Server/.test(modelRequests.at(-1).system));
+  await js(`(() => { document.querySelector('.composer .mode-btn').click(); document.querySelector('.mode-menu [data-mode=agent]').click(); })()`);
+
+  // ---- saved chats: New chat starts empty; the old one is in Recent chats and reopens with its context
+  await js(`t.btn('New chat').click()`);
+  expect('New chat clears the transcript', await until(`!t.chat().includes('enable example.com')`));
+  await js(`t.btn('Recent chats').click()`);
+  expect('the previous chat is listed under its first message', await until(`!!document.querySelector('.chat-history .history-item') && document.querySelector('.chat-history .history-title').textContent === 'enable example.com'`), await js(`document.querySelector('.chat-history').innerText`));
+  await js(`document.querySelector('.chat-history .history-open').click()`);
+  expect('reopening restores the transcript, with step logs and the mode it was in', (await until(`t.chat().includes('It failed to start.') && t.chat().includes('enable example.com')`)) && (await js(`!!document.querySelector('.msg.tool.has-log') && document.querySelector('.chat-history').classList.contains('hidden') && document.querySelector('.composer .mode-btn').dataset.mode === 'server'`)), await js(`t.chat()`));
+  await js(`(() => { document.querySelector('.composer .mode-btn').click(); document.querySelector('.mode-menu [data-mode=agent]').click(); })()`);
+  const before = modelRequests.length;
+  script.push(reply('Yes, I remember.'));
+  await js(`(() => { const box = document.querySelector('.composer textarea'); box.value = 'remember me?'; t.btn('Send').click(); })()`);
+  expect('a reopened chat continues with its earlier context', (await until(`t.chat().includes('Yes, I remember.')`)) && modelRequests.length === before + 1 && modelRequests.at(-1).messages[0].content === 'enable example.com', JSON.stringify(modelRequests.at(-1).messages.map((m) => m.role)));
+  await js(`t.btn('Recent chats').click()`);
+  expect('continuing a chat updates it rather than adding another', await until(`document.querySelectorAll('.chat-history .history-item').length === 1 && document.querySelector('.chat-history .history-item.current')`), await js(`document.querySelector('.chat-history').innerText`));
+  await js(`t.btn('Recent chats').click()`);
+
+  // ---- terminal panel: Ctrl+` opens a shell on the server, hides it again and keeps the session
+  const ctrlBacktick = async () => {
+    wc.focus();
+    wc.sendInputEvent({ type: 'keyDown', keyCode: '`', modifiers: ['control'] });
+    wc.sendInputEvent({ type: 'keyUp', keyCode: '`', modifiers: ['control'] });
+  };
+  await ctrlBacktick();
+  expect('Ctrl+` opens the terminal with a shell on the server', (await until(`(async () => !document.getElementById('terminal').classList.contains('hidden') && (await import('./views/terminal.js')).bufferText().includes('deploy@test-host:~$'))()`, 8000)) && shell.opened.length === 1 && shell.opened[0].term === 'xterm-256color', await js(`import('./views/terminal.js').then((m) => m.bufferText())`));
+  expect('the header names the server', (await js(`document.querySelector('#terminal .term-title').textContent`)) === 'deploy@test-host');
+  wc.sendInputEvent({ type: 'char', keyCode: 'l' });
+  wc.sendInputEvent({ type: 'char', keyCode: 's' });
+  wc.sendInputEvent({ type: 'keyDown', keyCode: 'Return' });
+  expect('keystrokes go to the shell and its output shows', (await until(`(async () => (await import('./views/terminal.js')).bufferText().includes('echo:s'))()`)) && shell.typed.startsWith('ls'), JSON.stringify(shell.typed));
+  expect('the shell is sized to the panel', shell.opened[0].cols > 40 && shell.opened[0].rows > 4, JSON.stringify(shell.opened));
+  await ctrlBacktick();
+  expect('Ctrl+` hides it again', await until(`document.getElementById('terminal').classList.contains('hidden')`));
+  await js(`document.getElementById('terminal-toggle').click()`);
+  expect('reopening keeps the same session', (await until(`!document.getElementById('terminal').classList.contains('hidden')`)) && shell.opened.length === 1);
+  await js(`t.btn('Close', document.getElementById('terminal')).click()`);
+  expect('Close ends the session and hides the panel', (await until(`document.getElementById('terminal').classList.contains('hidden')`)) && shell.opened.length === 1);
 
   // ---- transcript survives leaving the screen; settings has the key card
   await js(`t.nav('Settings')`);
@@ -413,7 +502,7 @@ app.whenReady().then(async () => {
   expect('the DNS breadcrumb goes back to the list', await until(`!!document.querySelector('#view tr.clickable') && !document.querySelector('#view .crumbs')`, 8000), await js(`t.view()`));
   // a site whose deploy project has no webhook says so and offers to add it
   READS.deploy.config.projects[0].app_port = 3000; // the port example.com forwards to
-  await js(`t.nav('Domains & nginx')`);
+  await js(`t.nav('Sites')`);
   expect('a site without its webhook is flagged, with a button to add it', await until(`t.view().includes('No webhook') && !!t.btn('Add webhook')`, 8000), await js(`t.view()`));
   await js(`t.btn('Add webhook').click()`);
   expect('the button opens the webhook review for the project behind that site', await until(`t.modalText().includes('Set up the GitHub webhook for app')`, 8000), await js(`t.modalText()`));
@@ -435,6 +524,51 @@ app.whenReady().then(async () => {
     JSON.stringify([vultrCalls, changes()])
   );
 
+  // ---- config editor: its own page under Sites; AI writes into it live; saving is reviewed
+  ran.length = 0;
+  stdins.length = 0;
+  await js(`t.nav('Sites')`);
+  await until(`!!document.querySelector('#view button.link')`, 8000);
+  await js(`document.querySelector('#view button.link').click()`);
+  const edModel = `monaco.editor.getEditors()[0].getModel()`;
+  expect(
+    'Edit opens a page (not a dialog) with breadcrumbs and the Monaco editor holding the file',
+    (await until(`window.monaco && monaco.editor.getEditors().length === 1 && !!document.querySelector('#view .monaco-editor .view-lines')`, 10000)) &&
+      (await js(`document.querySelector('#view .crumbs').innerText.replace(/\\s+/g, ' ').trim() === 'Sites › example.com' && !t.modal() && ${edModel}.getValue() === ${JSON.stringify(READS.nginx.sites[0].content)} && ${edModel}.getLanguageId() === 'nginx' && document.querySelector('#nav button.active').innerText.includes('Sites')`)),
+    await js(`t.view()`)
+  );
+  const tokens = await js(`monaco.editor.tokenize('server { listen 80; proxy_pass http://127.0.0.1:3000; set $a "x$host"; } # c', 'nginx')[0].map((t) => t.type)`);
+  expect('nginx syntax is highlighted', ['keyword.nginx', 'type.nginx', 'number.nginx', 'string.link.nginx', 'variable.nginx', 'comment.nginx'].every((t) => tokens.includes(t)), JSON.stringify(tokens));
+  // The full editor is loaded (suggestions, hover, formatting), not just Monaco's core API.
+  await js(`(() => { const e = monaco.editor.getEditors()[0]; e.getModel().setValue('server {\\nlisten 80;\\n location / {\\nreturn 200;\\n}\\n}\\n'); return e.getAction('editor.action.formatDocument').run(); })()`);
+  expect(
+    'the editor has suggestions and hover, and formats nginx',
+    (await js(`(() => { const e = monaco.editor.getEditors()[0]; return !!e.getContribution('editor.contrib.suggestController') && !!e.getContribution('editor.contrib.contentHover'); })()`)) &&
+      (await until(`${edModel}.getValue() === 'server {\\n    listen 80;\\n    location / {\\n        return 200;\\n    }\\n}\\n'`)),
+    await js(`${edModel}.getValue()`)
+  );
+  await js(`${edModel}.setValue('server {\\n    listen 80\\n    server_name example.com;\\n}\\n')`);
+  expect('the editor flags a missing semicolon', await until(`document.querySelector('#view .problems').innerText.includes('1 warning') && t.view().includes('Unsaved changes')`), await js(`document.querySelector('#view .editor-status').innerText`));
+
+  const generated = 'server {\n    listen 80;\n    server_name example.com;\n    gzip on;\n}\n';
+  script.push(reply('```nginx\n' + generated + '```'));
+  await js(`(() => { const p = document.querySelector('#view .ai-prompt'); p.value = 'turn on gzip'; t.btn('Generate').click(); })()`);
+  expect('AI output lands in the editor without its fences, then the diff opens', await until(`${edModel}.getValue() === ${JSON.stringify(generated)} && !!document.querySelector('#view .monaco-diff-editor') && t.view().includes('Showing what changed')`, 8000), await js(`[${edModel}.getValue(), t.view()]`));
+  const genReq = modelRequests[modelRequests.length - 1];
+  expect('the AI is given the current text and the request, and nothing ran on the server', genReq.system.includes('nginx configuration') && genReq.messages[0].content.includes('listen 80\n    server_name') && genReq.messages[0].content.includes('turn on gzip') && changes().length === 0, JSON.stringify([genReq.messages, changes()]).slice(0, 800));
+
+  await js(`t.btn('Sites', document.querySelector('#view .crumbs')).click()`);
+  expect('leaving keeps the edits as a draft, shown in the Sites table', await until(`t.view().includes('Unsaved edits')`, 8000), await js(`t.view()`));
+  await js(`document.querySelector('#view button.link').click()`);
+  expect('coming back restores the draft', await until(`window.monaco && monaco.editor.getEditors().length === 1 && ${edModel}.getValue() === ${JSON.stringify(generated)} && t.view().includes('unsaved edits from earlier')`, 8000), await js(`t.view()`));
+
+  await js(`t.btn('Save & reload nginx').click()`);
+  expect('save opens the review for this file', await until(`t.modalText().includes('Save example.com and reload nginx')`, 8000), await js(`t.modalText()`));
+  await js(`t.btn('Run command', t.modal()).click()`);
+  expect('approved: the generated config is written and the page shows it saved', await until(`t.view().includes('Saved on the server')`, 8000), await js(`t.view()`));
+  const written = stdins[ran.findIndex((l) => /cat > "\$f"/.test(l))];
+  expect('the file content written is exactly the editor text', written === generated, JSON.stringify([written, changes()]));
+
   // ---- a deploy in progress shows on the screen, in the menu and on the taskbar button
   const win = BrowserWindow.getAllWindows()[0];
   const taskbar = { progress: [], overlay: [] };
@@ -443,8 +577,14 @@ app.whenReady().then(async () => {
   win.setProgressBar = (v, o) => (taskbar.progress.push([v, o && o.mode]), setProgressBar(v, o));
   win.setOverlayIcon = (img, d) => (taskbar.overlay.push(img ? [img.getSize().width, d] : null), setOverlayIcon(img, d));
   ACTIVITY.deploying = true;
-  await js(`t.nav('Deploying now')`);
+  await js(`t.nav('Deployments')`);
   expect('the deploy is listed with its current step', await until(`t.view().includes('app') && t.view().includes('pushed to GitHub') && t.view().includes('docker compose up -d --build --remove-orphans')`, 8000), await js(`t.view()`));
+  expect('the history lists every deploy across repositories, newest first', await until(`t.view().includes('4 deploys') && t.view().indexOf('second app deploy') < t.view().indexOf('blog went wrong') && t.view().includes('old (removed project)')`, 8000), await js(`t.view()`));
+  await js(`[...document.querySelectorAll('#view tr.clickable')].find((r) => r.textContent.includes('me/app')).click()`);
+  expect('picking a repository shows only its deploys', await until(`t.view().includes('2 deploys of me/app') && t.view().includes('first app deploy') && !t.view().includes('blog went wrong')`, 8000), await js(`t.view()`));
+  expect('a pruned log is marked as removed', await until(`t.view().includes('Log removed')`, 2000), await js(`t.view()`));
+  await js(`[...document.querySelectorAll('#view tr.clickable')].find((r) => r.textContent.includes('me/app')).click()`);
+  expect('clicking it again shows all repositories', await until(`t.view().includes('4 deploys') && t.view().includes('blog went wrong')`, 8000), await js(`t.view()`));
   expect('the menu shows the count', await until(`document.querySelector('#nav .nav-count:not(.hidden)')?.textContent === '1'`, 4000), await js(`document.getElementById('nav').innerText`));
   const busy = Date.now() + 4000;
   while (Date.now() < busy && !(taskbar.overlay.some(Boolean) && win.getTitle().includes('1 deploying'))) await wait(100);

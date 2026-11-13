@@ -1,7 +1,8 @@
 'use strict';
 // The in-app assistant: a Claude tool-use loop whose tools are the app's own actions.
 //
-// The model can only do what actions.js defines - it has no shell. Every tool call goes
+// In Agent mode (the default) the model can only do what actions.js defines. Server mode adds
+// one more tool, server_command, which runs any shell command it writes. Every tool call goes
 // through runAction(), the same entry point the buttons use, so a change proposed by the
 // model stops at the same review gate as one made by hand: the exact commands are shown (in
 // the assistant panel, on the step that proposed them) and nothing runs until the user says so.
@@ -17,9 +18,12 @@ const RESULT_LIMIT = 60000; // characters of one tool result sent back to the mo
 
 let clientFactory = (apiKey) => new Anthropic(apiKey ? { apiKey } : {});
 
-const systemPrompt = (server) => `You are the assistant built into VPS Manager, a desktop app that manages one Ubuntu server over SSH. You are connected to ${server}. The app covers four areas: nginx sites and their HTTPS certificates, Docker containers and compose projects, push-to-deploy from GitHub through a webhook agent on the server, and DNS records for domains hosted on the user's Vultr account (the dns_ tools; these call the Vultr API rather than the server).
+const MODES = {
+  agent: `Mode: Agent. You act only through the app's own tools. server_command is switched off: you have no shell and cannot do anything the other tools don't cover. If the user asks for something outside them, say so plainly, tell them the command they could run themselves (the app has a terminal on the server: Ctrl+\` opens it), and mention that switching the assistant to Server mode lets you run commands for them.`,
+  server: `Mode: Server. Besides the app's own tools you can run any shell command with server_command. Prefer a dedicated tool when one fits, since its review card is clearer; use server_command for everything else: investigating problems (logs, journalctl, systemctl status, config files, disk, packages, processes, network) and fixing them. The user must press Run on every command, read-only ones included, so don't waste their clicks: combine related checks into one command, and don't re-run something whose output you already have. Commands run non-interactively without a terminal: avoid editors, pagers and prompts (use --no-pager, -y, cat, tee, sed -i). Before changing a file, back it up or show what will change; after a change, verify it worked (for example nginx -t, systemctl status).`,
+};
 
-You act only through the tools provided. You have no shell and cannot do anything they don't cover; if the user asks for something outside them, say so plainly and, where useful, tell them the command they could run themselves.
+const systemPrompt = (server, mode) => `You are the assistant built into VPS Manager, a desktop app that manages one Ubuntu server over SSH. You are connected to ${server}. The app covers four areas: nginx sites and their HTTPS certificates, Docker containers and compose projects, push-to-deploy from GitHub through a webhook agent on the server, and DNS records for domains hosted on the user's Vultr account (the dns_ tools; these call the Vultr API rather than the server).
 
 How changes work. Tools described as "CHANGES THE SERVER" do not run when you call them. The app first shows the user a card in this panel with what will happen and the exact commands, and asks whether to run it; nothing runs unless they press Run. That card is the question, so when the user has asked for something, call the tool rather than also asking "shall I go ahead?" in chat. Before every change tool call, say in a sentence or two what you are about to do and why, so the user can decide from your words and the card together. If a tool result says the user chose not to run it, do not call it again; ask what they would like instead.
 
@@ -27,7 +31,9 @@ Look before changing. Names of sites, containers and projects come from the list
 
 Use judgement about scope. Do what was asked and no more: don't restart, prune or reconfigure things on the side. When a request is ambiguous about which site, container or project is meant, ask. When a tool fails, read the error, explain it in plain words and suggest the next step; don't retry the same call unchanged.
 
-Replies are read in a narrow side panel next to the screen the user is working in. Keep them short and direct: lead with the answer or the outcome, then only the details that matter. The panel renders paragraphs, bullet lists, **bold**, \`inline code\` and fenced code blocks; it does not render tables or headings.`;
+Replies are read in a narrow side panel next to the screen the user is working in. Keep them short and direct: lead with the answer or the outcome, then only the details that matter. The panel renders paragraphs, bullet lists, **bold**, \`inline code\` and fenced code blocks; it does not render tables or headings.
+
+${MODES[mode] || MODES.agent}`;
 
 function clip(text) {
   if (text.length <= RESULT_LIMIT) return text;
@@ -57,11 +63,15 @@ function createChat({ actions, runAction, emit, apiKey, serverLabel }) {
 
   let messages = []; // Anthropic message params: the model's view of the conversation
   let controller = null;
+  let mode = 'agent'; // the current turn's mode: 'agent' or 'server'
 
   async function runTool(call) {
     const base = { type: 'tool_result', tool_use_id: call.id };
     const action = byTool.get(call.name);
     if (!action) return { ...base, is_error: true, content: `Unknown tool ${call.name}` };
+    if (action.serverMode && mode !== 'server') {
+      return { ...base, is_error: true, content: 'server_command is switched off because the assistant is in Agent mode. Nothing was run. Use the other tools, or tell the user the command and that they can switch the assistant to Server mode to let you run it.' };
+    }
     // Eager input streaming means the API has not validated this input; a truncated or
     // malformed one must never reach the action.
     const problem = validate(action.input, call.input);
@@ -87,11 +97,13 @@ function createChat({ actions, runAction, emit, apiKey, serverLabel }) {
     }
   }
 
-  async function send(text) {
+  /** opts.mode: 'agent' (default, the app's tools only) or 'server' (may also run shell commands). */
+  async function send(text, opts = {}) {
     if (controller) throw new Error('The assistant is still working on the previous message');
     if (!text.trim()) return;
     const server = serverLabel();
     if (!server) throw new Error('Connect to the server first');
+    mode = opts.mode === 'server' ? 'server' : 'agent';
 
     controller = new AbortController();
     const key = apiKey();
@@ -116,7 +128,7 @@ function createChat({ actions, runAction, emit, apiKey, serverLabel }) {
             betas: ['server-side-fallback-2026-07-01'],
             fallbacks: 'default',
             cache_control: { type: 'ephemeral' },
-            system: systemPrompt(server),
+            system: systemPrompt(server, mode),
             tools,
             messages: log,
           },
@@ -185,6 +197,11 @@ function createChat({ actions, runAction, emit, apiKey, serverLabel }) {
       if (controller) controller.abort();
       messages = [];
     },
+    /** Continue a saved conversation: its model history becomes the context for the next message. */
+    load(saved) {
+      if (controller) throw new Error('The assistant is still working. Stop it first.');
+      messages = Array.isArray(saved) ? saved : [];
+    },
     get busy() {
       return !!controller;
     },
@@ -197,6 +214,9 @@ function createChat({ actions, runAction, emit, apiKey, serverLabel }) {
 
 module.exports = createChat;
 module.exports.MODEL = MODEL;
+module.exports.describeError = describeError;
+/** An Anthropic client from the same factory the tests replace (used by the config writer too). */
+module.exports.client = (apiKey) => clientFactory(apiKey);
 /** Tests replace the Anthropic client with a scripted one. */
 module.exports.setClientFactory = (fn) => {
   clientFactory = fn;

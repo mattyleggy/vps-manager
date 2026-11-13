@@ -113,8 +113,12 @@ function summarize(src) {
     });
     servers.push(s);
   });
+  // Folders recorded by the "App + WebSocket" template: "# vps-manager app-folder /path".
+  const folders = {};
+  for (const m of String(src).matchAll(/^[ 	]*#[ 	]*vps-manager[ 	]+(app|ws)-folder[ 	]+(\/\S*)[ 	]*$/gm)) folders[m[1]] = m[2];
   return {
     servers,
+    folders,
     domains: uniq(servers.flatMap((s) => s.names).filter((n) => n && n !== '_' && n !== 'localhost' && !n.startsWith('~'))),
     targets: uniq(servers.flatMap((s) => (s.proxies.length ? s.proxies : s.roots))),
     certs: uniq(servers.flatMap((s) => s.certs)),

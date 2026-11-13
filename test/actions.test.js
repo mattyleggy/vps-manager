@@ -36,6 +36,7 @@ test('every change action produces review text for a valid input', async () => {
     'nginx:enable': { name: 'a.com' },
     'nginx:disable': { name: 'a.com' },
     'nginx:delete': { name: 'a.com' },
+    'nginx:siteLog': { name: 'a.com' },
     'nginx:certbot': { domains: ['a.com'] },
     'docker:container': { name: 'web', action: 'stop' },
     'docker:compose': { project: 'app', action: 'rebuild' },
@@ -51,6 +52,7 @@ test('every change action produces review text for a valid input', async () => {
     'dns:point': { domains: ['a.com'] },
     'dns:saveRecord': { zone: 'a.com', type: 'A', name: 'www', data: '203.0.113.10' },
     'dns:deleteRecord': { zone: 'a.com', id: 'abc' },
+    'server:command': { command: 'systemctl status nginx --no-pager', purpose: 'Check nginx', asRoot: true },
   };
   for (const a of actions.filter((x) => x.change)) {
     const input = samples[a.id] || {};
@@ -81,4 +83,15 @@ test('results shown to the model hide the webhook secret and bulky file contents
   const list = byId.get('nginx:list').forModel({ installed: true, sites: [{ name: 'a', kind: 'site', enabled: true, content: 'BIG FILE', certExpiry: {}, summary: { domains: ['a.com'], targets: [], ssl: false } }] });
   assert.ok(!JSON.stringify(list).includes('BIG FILE'));
   assert.deepStrictEqual(list.sites[0].domains, ['a.com']);
+});
+
+test('server:command asks before running, flags destructive commands, and shows the model the output', async () => {
+  const a = byId.get('server:command');
+  assert.ok(a.change && a.serverMode, 'it must go through review and be gated to Server mode');
+  assert.strictEqual(a.review({ command: 'df -h', purpose: 'Check disk' }).danger, false);
+  assert.strictEqual(a.review({ command: 'df -h', purpose: 'Check disk' }).title, 'Check disk');
+  for (const cmd of ['rm -rf /var/www/old', 'sudo reboot', 'systemctl stop nginx', 'apt-get purge -y php8.1', 'ufw disable', 'echo x > /etc/hosts']) {
+    assert.strictEqual(a.review({ command: cmd, purpose: 'p' }).danger, true, cmd);
+  }
+  assert.deepStrictEqual(a.forModel({ code: 1, output: '$ df -h\nboom\n' }), { exitCode: 1, output: 'boom\n' });
 });

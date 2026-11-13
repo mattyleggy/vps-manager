@@ -35,7 +35,19 @@ const ICONS = {
   deploys: 'M12 3v12M7 10l5 5 5-5M5 21h14',
   settings: 'M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4',
   sparkle: 'M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z',
+  instance: 'M3 3v18h18M7 15l4-5 3 3 5-7',
   server: 'M3 4h18v7H3zM3 13h18v7H3zM7 7.5h.01M7 16.5h.01',
+  terminal: 'M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zM7 9l3 3-3 3M12 15h5',
+  repos: 'M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9',
+  patches: 'M12 2l8 3v6c0 5-3.5 9-8 11-4.5-2-8-6-8-11V5zM9 12l2 2 4-4',
+  file: 'M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9zM14 3v6h6M9 13h6M9 17h4',
+  traffic: 'M4 20V10M9 20V4M14 20v-7M19 20V8',
+  send: 'M22 2 11 13M22 2l-7 20-4-9-9-4z',
+  stop: 'M7 7h10v10H7z',
+  history: 'M3 12a9 9 0 1 0 2.6-6.4L3 8M3 3v5h5M12 7v5l3 2',
+  trash: 'M4 7h16M10 11v6M14 11v6M5 7l1 13h12l1-13M9 7V4h6v3',
+  chevron: 'M6 9l6 6 6-6',
+  check: 'M5 12l5 5L20 7',
 };
 
 export function icon(name, size = 18) {
@@ -163,9 +175,21 @@ export function reviewModal(plan) {
   });
 }
 
+/** A button that copies whatever `getText()` returns when pressed (so live logs copy their current text). */
+export function copyButton(getText, label = 'Copy', cls = 'small') {
+  return button(label, () => {
+    const text = getText() || '';
+    if (!text) return toast('Nothing to copy yet');
+    api('clipboard:write', text).then(() => toast('Copied', 'ok'), (e) => toast(e.message, 'error'));
+  }, cls);
+}
+
+/** Footer for a log dialog: Copy to clipboard + Close. */
+export const logActions = (pre) => (close) => [copyButton(() => pre.textContent, 'Copy to clipboard'), button('Close', close)];
+
 export function showOutput(title, text) {
   const pre = h('pre', { class: 'output' }, text || '(no output)');
-  modal({ title, wide: true, body: pre });
+  modal({ title, wide: true, body: pre, actions: text ? logActions(pre) : undefined });
   requestAnimationFrame(() => (pre.scrollTop = pre.scrollHeight));
 }
 
@@ -185,12 +209,34 @@ export function badge(text, kind = '') {
   return h('span', { class: `badge ${kind}` }, text);
 }
 
+/** A short commit hash that opens the commit on GitHub (plain text when the repo is unknown). */
+export function commitLink(repo, commit, len = 7) {
+  const short = commit.slice(0, len);
+  const slug = repo && /^[\w.-]+\/[\w.-]+$/.test(repo) ? repo : null;
+  if (!slug || !/^[0-9a-f]{4,40}$/i.test(commit)) return h('span', { class: 'mono' }, short);
+  const url = `https://github.com/${slug}/commit/${commit}`;
+  return h('button', { type: 'button', class: 'link mono', title: `Open ${short} on GitHub`, onclick: () => api('open:external', url).catch(() => {}) }, short);
+}
+
 export function copyLine(text, { display } = {}) {
   return h(
     'div',
     { class: 'copyline' },
     h('code', { title: display ? '' : text }, display || text),
     button('Copy', () => api('clipboard:write', text).then(() => toast('Copied', 'ok')), 'small')
+  );
+}
+
+/** Sites › example.com — each [label, onClick] is a link back up; the last item is the current page. */
+export function breadcrumbs(items) {
+  // Same markup and look as the DNS screen's zone pages.
+  return h(
+    'nav',
+    { class: 'crumbs', 'aria-label': 'Breadcrumb' },
+    items.map(([label, onClick], i) => [
+      i > 0 && h('span', { class: 'sep', 'aria-hidden': 'true' }, '›'),
+      onClick ? h('button', { class: 'crumb', type: 'button', onclick: onClick }, label) : h('span', { class: 'crumb here', 'aria-current': 'page' }, label),
+    ])
   );
 }
 

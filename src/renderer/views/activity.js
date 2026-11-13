@@ -1,6 +1,7 @@
-import { h, api, act, button, badge, pageHead, table, modal, showOutput, fmtDuration, timeAgo } from '../ui.js';
+import { h, api, act, button, badge, pageHead, table, modal, logActions, showOutput, fmtDuration, timeAgo, commitLink, select } from '../ui.js';
 
-// What is being deployed or built on the server right now. Polls while the screen is open.
+// Deployments: what is being deployed or built on the server right now (polled while the
+// screen is open), and the full deploy history, for all repositories or one.
 
 const POLL_MS = 3000;
 const LOG_POLL_MS = 2000;
@@ -12,7 +13,7 @@ function watchLog(title, file) {
   const pre = h('pre', { class: 'output live-log' }, 'Loading…');
   let open = true;
   let last = '';
-  modal({ title, wide: true, body: pre, onClose: () => (open = false) });
+  modal({ title, wide: true, body: pre, actions: logActions(pre), onClose: () => (open = false) });
   (async function tick() {
     if (!open) return;
     try {
@@ -78,23 +79,121 @@ function settlingTable(list) {
   );
 }
 
-function recentTable(list) {
+// ---- history: every past deploy, all repositories or one ----
+
+const PAGE = 100;
+// The repository picked, kept while the app runs so coming back shows the same one.
+let pickedRepo = null;
+
+const repoLabel = (g) => g.repo || `${g.projects[0]}${g.removed ? ' (removed project)' : ''}`;
+const when = (t) => (t ? new Date(t * 1000).toLocaleString() : '—');
+
+function logButton(e) {
+  if (!e.log) return null;
+  if (!e.logKept) return h('span', { class: 'muted', title: 'The deploy agent keeps the newest 30 logs per project; this one has been removed.' }, 'Log removed');
+  return button('Log', (b) => act(b, async () => showOutput(`${e.project} — ${when(e.started)}`, await api('deploy:log', { file: e.log }))), 'small');
+}
+
+function historyRow(e, showRepo) {
+  return h(
+    'tr',
+    null,
+    h('td', { class: 'muted', title: when(e.started) }, timeAgo(e.finished || e.started), h('div', { class: 'muted' }, when(e.started))),
+    h('td', null, e.project, showRepo && e.repo && h('div', { class: 'muted mono' }, e.repo), e.message && h('div', { class: 'muted' }, e.message)),
+    h('td', null, badge(e.code === 0 ? 'Succeeded' : 'Failed', e.code === 0 ? 'ok' : 'bad')),
+    h('td', { class: 'muted' }, e.trigger || '', e.commit && ' ', e.commit && commitLink(e.repo, e.commit, 8)),
+    h('td', { class: 'muted' }, e.finished && e.started ? fmtDuration(e.finished - e.started) : '—'),
+    h('td', { class: 'actions' }, logButton(e))
+  );
+}
+
+function reposTable(repos, onPick) {
   return table(
-    ['Project', 'Result', 'Trigger', 'Finished', 'Took', ''],
-    list.map((e) =>
+    ['Repository', 'Projects', 'Deploys', 'Succeeded', 'Failed', 'Last deploy', 'Avg time'],
+    repos.map((g) =>
       h(
         'tr',
-        null,
-        h('td', null, e.project, e.message && h('div', { class: 'muted' }, e.message)),
-        h('td', null, badge(e.code === 0 ? 'Succeeded' : 'Failed', e.code === 0 ? 'ok' : 'bad')),
-        h('td', { class: 'muted' }, `${e.trigger || ''}${e.commit ? ` ${e.commit.slice(0, 8)}` : ''}`),
-        h('td', { class: 'muted' }, timeAgo(e.finished)),
-        h('td', { class: 'muted' }, fmtDuration(e.finished - e.started)),
-        h('td', { class: 'actions' }, e.log && button('Log', (b) => act(b, async () => showOutput(`${e.project} — ${new Date(e.started * 1000).toLocaleString()}`, await api('deploy:log', { file: e.log }))), 'small'))
+        { class: `clickable ${g.key === pickedRepo ? 'selected' : ''}`, tabindex: '0', title: `Show only ${repoLabel(g)}`, onclick: () => onPick(g.key), onkeydown: (ev) => ev.key === 'Enter' && onPick(g.key) },
+        h('td', { class: g.repo ? 'mono' : '' }, repoLabel(g)),
+        h('td', { class: 'muted' }, g.projects.join(', ')),
+        h('td', null, String(g.deploys)),
+        h('td', null, g.succeeded ? badge(String(g.succeeded), 'ok') : h('span', { class: 'muted' }, '0')),
+        h('td', null, g.failed ? badge(String(g.failed), 'bad') : h('span', { class: 'muted' }, '0')),
+        h('td', { class: 'muted' }, g.lastStarted ? [timeAgo(g.lastStarted), ' ', badge(g.lastCode === 0 ? 'ok' : 'failed', g.lastCode === 0 ? 'ok' : 'bad')] : 'never'),
+        h('td', { class: 'muted' }, g.avgTime != null ? fmtDuration(g.avgTime) : '—')
       )
     ),
-    'No deploys from the deploy agent yet.'
+    'No deploy projects yet.'
   );
+}
+
+/** The "History" part of the screen. `reload()` fetches again (after a deploy finishes). */
+function historySection() {
+  const el = h('div', null, h('div', { class: 'loading' }, 'Loading history…'));
+  let data = null;
+  let gen = 0;
+
+  async function load(append = false) {
+    const my = ++gen;
+    const offset = append && data ? data.entries.length : 0;
+    try {
+      const r = await api('activity:history', pickedRepo ? { repo: pickedRepo, offset, limit: PAGE } : { offset, limit: PAGE });
+      if (my !== gen) return;
+      // A repository that no longer appears (its project removed and never deployed): show all.
+      if (pickedRepo && !r.repos.some((g) => g.key === pickedRepo)) {
+        pickedRepo = null;
+        return load();
+      }
+      data = append && data ? { ...r, entries: [...data.entries, ...r.entries] } : r;
+      draw();
+    } catch (e) {
+      if (my === gen) el.replaceChildren(h('div', { class: 'error-box' }, e.message));
+    }
+  }
+
+  function pick(key) {
+    pickedRepo = key === pickedRepo ? null : key;
+    el.querySelectorAll('.history-list').forEach((n) => n.classList.add('dim'));
+    load();
+  }
+
+  function draw() {
+    const d = data;
+    const picked = d.repos.find((g) => g.key === pickedRepo);
+    const picker = select([['', `All repositories (${d.repos.reduce((n, g) => n + g.deploys, 0)})`], ...d.repos.map((g) => [g.key, `${repoLabel(g)} (${g.deploys})`])], pickedRepo || '');
+    picker.addEventListener('change', () => pick(picker.value || null));
+    const more = d.entries.length < d.matching && button(`Show more (${d.matching - d.entries.length} older)`, (b) => act(b, () => load(true)));
+    el.replaceChildren(
+      h(
+        'div',
+        { class: 'section' },
+        h('div', { class: 'section-head' }, h('h2', null, 'By repository'), h('span', { class: 'muted' }, 'click a row to see only its deploys')),
+        reposTable(d.repos, pick)
+      ),
+      h(
+        'div',
+        { class: 'section' },
+        h(
+          'div',
+          { class: 'section-head' },
+          h('h2', null, 'History'),
+          h('span', { class: 'muted' }, picked ? `${d.matching} deploy${d.matching === 1 ? '' : 's'} of ${repoLabel(picked)}` : `${d.matching} deploy${d.matching === 1 ? '' : 's'}`),
+          h('span', { class: 'spacer' }),
+          picker
+        ),
+        d.truncated && h('div', { class: 'info-box' }, 'Only the newest 5,000 deploys on record are shown.'),
+        h(
+          'div',
+          { class: 'history-list' },
+          table(['When', 'Project', 'Result', 'Trigger', 'Took', ''], d.entries.map((e) => historyRow(e, !picked)), picked ? 'No deploys of this repository yet.' : 'No deploys from the deploy agent yet.')
+        ),
+        more && h('div', { class: 'stat-action' }, more)
+      )
+    );
+  }
+
+  load();
+  return { el, reload: () => load() };
 }
 
 function content(d) {
@@ -119,15 +218,19 @@ function content(d) {
       )
     );
   }
-  out.push(h('div', { class: 'section' }, h('div', { class: 'section-head' }, h('h2', null, 'Recently finished')), recentTable(d.recent)));
   return out;
 }
+
+// What identifies the newest finished deploy: when it changes, the history is fetched again.
+const lastFinished = (d) => (d.recent && d.recent[0] ? `${d.recent[0].project}@${d.recent[0].started}` : '');
 
 export function render(root) {
   const status = h('span', { class: 'muted live' }, h('span', { class: 'dot ok' }), 'Live');
   const body = h('div', null, h('div', { class: 'loading' }, 'Loading…'));
+  const history = historySection();
   let timer = null;
   let busy = false;
+  let seen = null;
 
   async function tick() {
     clearTimeout(timer);
@@ -138,6 +241,9 @@ export function render(root) {
       window.dispatchEvent(new CustomEvent('activity-count', { detail: d.active.length }));
       if (!root.isConnected) return;
       body.replaceChildren(...content(d));
+      const last = lastFinished(d);
+      if (seen !== null && last !== seen) history.reload();
+      seen = last;
       status.replaceChildren(h('span', { class: 'dot ok' }), `Live · updated ${new Date().toLocaleTimeString()}`);
     } catch (e) {
       if (!root.isConnected) return;
@@ -150,9 +256,10 @@ export function render(root) {
   }
 
   root.append(
-    pageHead('Deploying now', status, button('Refresh', () => tick())),
-    h('div', { class: 'field muted' }, 'Deploys from the deploy agent, plus Docker builds, compose, image pulls, git, certbot and apt runs started any other way (including by hand over SSH). Refreshes every few seconds while this screen is open.'),
-    body
+    pageHead('Deployments', status, button('Refresh', () => (tick(), history.reload()))),
+    h('div', { class: 'field muted' }, 'What is deploying now — deploys from the deploy agent, plus Docker builds, compose, image pulls, git, certbot and apt runs started any other way (including by hand over SSH) — and every past deploy, for all repositories or one. Refreshes every few seconds while this screen is open.'),
+    body,
+    history.el
   );
   tick();
 }

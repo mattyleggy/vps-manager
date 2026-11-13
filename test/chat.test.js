@@ -158,3 +158,26 @@ test('an unparseable tool input (non-API error) re-issues the turn instead of fa
   assert.ok(!events.some((e) => e.type === 'error'));
   assert.strictEqual(chat.history.length, 2);
 });
+
+test('server_command is refused in Agent mode and runs (through review) in Server mode', async () => {
+  const actions = [...ACTIONS, { id: 'server:command', change: true, serverMode: true, description: 'run a shell command on the server', input: { type: 'object', properties: { command: { type: 'string' }, purpose: { type: 'string' } }, required: ['command', 'purpose'], additionalProperties: false }, review: () => ({}), run: () => {} }];
+  const ran = [];
+  const make = () =>
+    createChat({ actions, runAction: async (id, input) => (ran.push(id), { ok: true, data: { code: 0, output: 'ok' } }), emit: () => {}, apiKey: () => 'k', serverLabel: () => 'matt@host' });
+  const cmd = { command: 'df -h', purpose: 'Check disk' };
+
+  let requests = scripted([call('server_command', cmd), say('Switch to Server mode.')]);
+  let chat = make();
+  assert.ok(chat.tools.some((t) => t.name === 'server_command'), 'the tool list stays the same in both modes');
+  await chat.send('check disk');
+  assert.deepStrictEqual(ran, []);
+  assert.match(requests[0].system, /Mode: Agent/);
+  assert.match(requests[1].messages[2].content[0].content, /Agent mode/);
+
+  requests = scripted([call('server_command', cmd), say('Plenty of space.')]);
+  chat = make();
+  await chat.send('check disk', { mode: 'server' });
+  assert.deepStrictEqual(ran, ['server:command']);
+  assert.match(requests[0].system, /Mode: Server/);
+  assert.strictEqual(requests[1].messages[2].content[0].is_error, undefined);
+});

@@ -22,13 +22,16 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 # Server-wide GitHub key. /root/.ssh/config points github.com at it, so a plain
 # "git pull" works in deploy commands (and in a root shell) with no extra setup.
 SERVER_KEY = "/root/.ssh/github_deploy_ed25519"
 CONFIG = os.environ.get("DEPLOY_AGENT_CONFIG", "/etc/deploy-agent/config.json")
 LOG_DIR = os.environ.get("DEPLOY_AGENT_LOGS", "/var/log/deploy-agent")
 MAX_BODY = 5 * 1024 * 1024
+# Who owns a project's files. The agent clones and pulls as root; afterwards it hands what it
+# wrote to this user (a project's "owner" setting overrides it). "user" alone means user:user's group.
+DEFAULT_OWNER = "matt:matt"
 KEEP_LOGS = 30
 
 
@@ -132,7 +135,87 @@ def setup_env(project, emit):
     if port:
         set_env_value(env_file, "APP_PORT", str(int(port)))
         emit("set APP_PORT=%d in .env\n" % int(port))
+    give_to_owner(project, emit)
     return 0
+
+
+def resolve_owner(project):
+    """(uid, gid, "user:group") for the project's owner, or None if that user does not exist here."""
+    import grp
+    import pwd
+    spec = project.get("owner") or DEFAULT_OWNER
+    user, _, group = spec.partition(":")
+    try:
+        pw = pwd.getpwnam(user)
+        gid = grp.getgrnam(group).gr_gid if group else pw.pw_gid
+    except KeyError:
+        return None
+    return pw.pw_uid, gid, spec
+
+
+def _chown(p, owner, only_root):
+    try:
+        if only_root and os.lstat(p).st_uid != 0:
+            return
+        os.lchown(p, owner[0], owner[1])
+    except OSError:
+        pass
+
+
+def give_to_owner(project, emit, created=(), whole=False):
+    """Hand files the agent (root) wrote to the project's owner.
+
+    whole: everything under the checkout (right after a fresh clone). Otherwise only root-owned
+    entries in .git, git-tracked files (and their folders) and .env - what a "git pull" writes -
+    so data folders that containers own (a database volume, say) are never touched.
+    """
+    if os.name != "posix":  # no users to hand files to (only when testing off Linux)
+        return
+    owner = resolve_owner(project)
+    if owner is None:
+        emit("deploy-agent: user %s does not exist on this server; files stay owned by root\n"
+             % (project.get("owner") or DEFAULT_OWNER).split(":")[0])
+        return
+    path = project["path"]
+    for d in created:
+        _chown(d, owner, False)
+    if whole:
+        _chown(path, owner, False)
+        for root, dirs, files in os.walk(path):
+            for n in dirs + files:
+                _chown(os.path.join(root, n), owner, False)
+        emit("deploy-agent: %s is now owned by %s\n" % (path, owner[2]))
+        return
+    _chown(path, owner, True)
+    for root, dirs, files in os.walk(os.path.join(path, ".git")):
+        _chown(root, owner, True)
+        for n in files:
+            _chown(os.path.join(root, n), owner, True)
+    _chown(os.path.join(path, ".env"), owner, True)
+    try:
+        r = subprocess.run(["git", "ls-files", "-z"], cwd=path, env=deploy_env(project),
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        tracked = [f for f in r.stdout.decode("utf-8", "surrogateescape").split("\0") if f]
+    except Exception:  # noqa: BLE001
+        tracked = []
+    seen = set()
+    for f in tracked:
+        _chown(os.path.join(path, f), owner, True)
+        d = os.path.dirname(f)
+        while d and d not in seen:
+            seen.add(d)
+            _chown(os.path.join(path, d), owner, True)
+            d = os.path.dirname(d)
+
+
+def missing_dirs(path):
+    """The folders os.makedirs(path) would create, outermost first."""
+    out = []
+    path = os.path.abspath(path)
+    while path and path != "/" and not os.path.exists(path):
+        out.append(path)
+        path = os.path.dirname(path)
+    return out[::-1]
 
 
 def head_commit(project):
@@ -187,17 +270,22 @@ def run_deploy(project, trigger, commit="", message="", echo=False, on_start=Non
                 if not os.path.isdir(os.path.join(path, ".git")):
                     use_ssh = "GIT_SSH_COMMAND" in env or os.path.isfile(SERVER_KEY)
                     fmt = "git@github.com:%s.git" if use_ssh else "https://github.com/%s.git"
-                    os.makedirs(os.path.dirname(path.rstrip("/")) or "/", exist_ok=True)
+                    parent = os.path.dirname(path.rstrip("/")) or "/"
+                    created = missing_dirs(parent)
+                    os.makedirs(parent, exist_ok=True)
                     code = step("git clone --branch %s %s %s" % (
                         shlex.quote(branch), shlex.quote(fmt % project["repo"]), shlex.quote(path)), "/", env)
                     if code == 0:
                         prepare_env(path, project.get("app_port"), emit)
+                        give_to_owner(project, emit, created=created, whole=True)
                 if code == 0 and project.get("ssh_key") and "GIT_SSH_COMMAND" in env:
                     # Record the per-project key in the checkout, so a manual "git pull" there uses it too.
                     subprocess.run(["git", "config", "core.sshCommand", env["GIT_SSH_COMMAND"]], cwd=path, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if code == 0:
                     code = step(project.get("command") or default_command(project), path, env)
+                    # The command ran as root: a "git pull" in it leaves root-owned files behind.
+                    give_to_owner(project, emit)
             except Exception as e:  # noqa: BLE001 - report anything to the log
                 emit("deploy-agent error: %s\n" % e)
                 code = 1

@@ -2,10 +2,13 @@
 const fs = require('fs');
 const path = require('path');
 const { app, safeStorage } = require('electron');
+const { check } = require('./validate');
 
 const DEFAULTS = {
   connection: { host: '', port: 22, username: 'root', authType: 'key', keyPath: '', secretEnc: '' },
   hostKeys: {},
+  // Sites pinned to the menu, per server (host:port) -> [{ name, kind }].
+  pins: {},
   certEmail: '',
   ai: { keyEnc: '' },
   github: { tokenEnc: '' },
@@ -22,7 +25,7 @@ function load() {
   if (cache) return cache;
   try {
     const raw = JSON.parse(fs.readFileSync(file(), 'utf8'));
-    cache = { ...DEFAULTS, ...raw, connection: { ...DEFAULTS.connection, ...(raw.connection || {}) }, ai: { ...DEFAULTS.ai, ...(raw.ai || {}) }, github: { ...DEFAULTS.github, ...(raw.github || {}) }, vultr: { ...DEFAULTS.vultr, ...(raw.vultr || {}) }, app: { ...DEFAULTS.app, ...(raw.app || {}) } };
+    cache = { ...DEFAULTS, ...raw, connection: { ...DEFAULTS.connection, ...(raw.connection || {}) }, ai: { ...DEFAULTS.ai, ...(raw.ai || {}) }, github: { ...DEFAULTS.github, ...(raw.github || {}) }, vultr: { ...DEFAULTS.vultr, ...(raw.vultr || {}) }, app: { ...DEFAULTS.app, ...(raw.app || {}) }, pins: { ...(raw.pins || {}) } };
   } catch {
     cache = JSON.parse(JSON.stringify(DEFAULTS));
   }
@@ -82,6 +85,21 @@ module.exports = {
   githubToken: () => decrypt(load().github.tokenEnc) || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '',
   /** The saved Vultr API key, else the VULTR_API_KEY environment variable, else ''. */
   vultrKey: () => decrypt(load().vultr.keyEnc) || process.env.VULTR_API_KEY || '',
+  pins: (id) => (load().pins[id] || []).map((p) => ({ ...p })),
+  /** Pin a site to the menu, or unpin it if it already is. Returns the new list. */
+  togglePin(id, { name, kind = 'site' }) {
+    check('siteName', name);
+    if (!['site', 'conf.d'].includes(kind)) throw new Error(`Unknown config kind "${kind}"`);
+    const s = load();
+    const list = s.pins[id] || [];
+    const i = list.findIndex((p) => p.name === name && p.kind === kind);
+    if (i >= 0) list.splice(i, 1);
+    else list.push({ name, kind });
+    if (list.length) s.pins[id] = list;
+    else delete s.pins[id];
+    save();
+    return list.map((p) => ({ ...p }));
+  },
   hostKeyId: (c) => `${c.host}:${Number(c.port) || 22}`,
   setHostKey(id, fp) {
     load().hostKeys[id] = fp;

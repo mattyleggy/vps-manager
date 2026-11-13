@@ -148,6 +148,7 @@ class Ssh extends EventEmitter {
    */
   exec(cmd, opts = {}) {
     let report = null; // set for an approved step when the operation wants progress (op.onStep)
+    let tap = null; // set for an approved step when the operation wants its output (op.onOutput)
     if (!opts.read) {
       if (!this.client) return Promise.reject(new Error('Not connected to the server'));
       const op = ops.getStore();
@@ -173,6 +174,11 @@ class Ssh extends EventEmitter {
         report = (state, code) => op.onStep(index, state, code);
         report('run');
       }
+      if (op.onOutput) {
+        tap = op.onOutput;
+        const lines = step.cmd.split('\n');
+        tap(`$ ${step.what && lines.length > 1 ? `${step.what} (${lines.length}-line script)` : lines[0]}\n`);
+      }
     }
     const done = new Promise((resolve, reject) => {
       if (!this.client) return reject(new Error('Not connected to the server'));
@@ -195,15 +201,18 @@ class Ssh extends EventEmitter {
           const s = dOut.write(d);
           stdout += s;
           if (opts.onData) opts.onData(stripAnsi(s));
+          if (tap) tap(stripAnsi(s));
         });
         stream.stderr.on('data', (d) => {
           const s = dErr.write(d);
           stderr += s;
           if (opts.onData) opts.onData(stripAnsi(s));
+          if (tap) tap(stripAnsi(s));
         });
         stream.on('close', (code) => {
           if (done) return;
           clearTimeout(timer);
+          if (tap && code !== 0) tap(`\n[exit code ${code == null ? '?' : code}]\n`);
           resolve({ code: code == null ? -1 : code, stdout, stderr });
         });
         stream.end(opts.input != null ? opts.input : undefined);
@@ -260,6 +269,7 @@ class Ssh extends EventEmitter {
     if (!approved || approved.cmd !== step.cmd || approved.via !== step.via) {
       throw new Error('The plan changed between the review and the run, so the remaining steps were not run. Start the action again to review an updated plan.');
     }
+    if (op.onOutput) op.onOutput(`> ${what || via} (${via})\n`);
     if (!op.onStep) return fn();
     const index = op.next - 1;
     op.onStep(index, 'run');
@@ -279,6 +289,18 @@ class Ssh extends EventEmitter {
     if (!op) return make();
     if (!(key in op.memo)) op.memo[key] = make();
     return op.memo[key];
+  }
+
+  /**
+   * An interactive login shell on a pseudo-terminal, for the terminal panel. This is the user
+   * typing at the server themselves, so it is deliberately outside the review gate.
+   * Resolves the ssh2 channel (a duplex stream with setWindow(rows, cols, height, width)).
+   */
+  shell({ cols = 80, rows = 24 } = {}) {
+    return new Promise((resolve, reject) => {
+      if (!this.client) return reject(new Error('Not connected to the server'));
+      this.client.shell({ term: 'xterm-256color', cols, rows }, (err, stream) => (err ? reject(err) : resolve(stream)));
+    });
   }
 
   /** Write a file as root via stdin (no temp files, no SFTP). */

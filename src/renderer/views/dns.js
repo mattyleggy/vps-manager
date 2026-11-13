@@ -155,7 +155,7 @@ function nameserverNote(nameservers, zone) {
   );
 }
 
-/** Point hostnames at the server through Vultr DNS and say what happened. Shared with the Domains screen. */
+/** Point hostnames at the server through Vultr DNS and say what happened. Shared with the Sites screen. */
 export async function pointHere(domains, ctx) {
   const r = await api('dns:point', { domains });
   const n = (status) => r.results.filter((x) => x.status === status).length;

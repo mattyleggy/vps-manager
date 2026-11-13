@@ -2,6 +2,7 @@ import { h, api, act, button, badge, modal, field, input, select, pageHead, tabl
 import { launchModal } from './launch.js';
 import { pointHere } from './dns.js';
 import { projectModal } from './deploys.js';
+import { hasDraft } from './site.js';
 
 /** Set up auto-deploy for a site that has none: the server works out its folder, repo and command. */
 async function autoDeploy(site, ctx) {
@@ -22,45 +23,8 @@ function certBadge(site) {
   return badge(`HTTPS · ${days}d left`, days < 21 ? 'warn' : 'ok');
 }
 
-function editSite(site, ctx) {
-  const ta = h('textarea', { class: 'editor', spellcheck: 'false' });
-  ta.value = site.content;
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      ta.setRangeText('    ', ta.selectionStart, ta.selectionEnd, 'end');
-    }
-  });
-  const err = h('div', { class: 'error-box hidden' });
-  modal({
-    title: `Edit ${site.path}`,
-    wide: true,
-    body: [ta, err, h('div', { class: 'hint muted' }, 'Saving runs nginx -t first. If the test fails the previous file is restored and nothing is reloaded.')],
-    actions: (close) => [
-      button('Cancel', close),
-      button(
-        'Save & reload nginx',
-        async (btn) => {
-          btn.disabled = true;
-          err.classList.add('hidden');
-          try {
-            await api('nginx:save', { name: site.name, kind: site.kind, content: ta.value });
-            close();
-            toast('Saved and reloaded', 'ok');
-            ctx.refresh();
-          } catch (e) {
-            if (e.cancelled) return;
-            err.textContent = `Not saved — nginx rejected this config:\n\n${e.message}`;
-            err.classList.remove('hidden');
-          } finally {
-            btn.disabled = false;
-          }
-        },
-        'primary'
-      ),
-    ],
-  });
-}
+/** The config editor is a page of its own (Sites › name). */
+const editSite = (site, ctx) => ctx.go('site', false, { name: site.name, kind: site.kind });
 
 // What each site type needs from the form. Port types forward to an app on a local port;
 // folder types are served by nginx (or PHP-FPM) straight from a folder.
@@ -68,6 +32,13 @@ const SITE_TYPES = {
   nextjs: { label: 'Next.js app', port: 3000, hint: 'Run the app on this port, e.g. “next start -p PORT”, or in docker-compose: ports: "127.0.0.1:PORT:3000".' },
   laravel: { label: 'Laravel app on a port (Docker / Octane)', port: 8000, hint: 'Publish the app’s web port on this one, e.g. in docker-compose: ports: "127.0.0.1:PORT:80". Laravel should trust the proxy so it sees HTTPS.' },
   'laravel-fpm': { label: 'Laravel on PHP-FPM installed on this server', folder: '/opt/apps/myapp', hint: 'The Laravel app folder. nginx serves its public/ folder through the newest PHP-FPM found on the server.' },
+  'app-websocket': {
+    label: 'App + Node.js WebSocket server (two ports)',
+    port: 3000,
+    ws: true,
+    hint: 'The port the app (website / API) listens on.',
+    wsHint: 'The port your Node.js WebSocket server (ws, Socket.IO, …) listens on. Requests under the path below go there; everything else goes to the app.',
+  },
   proxy: { label: 'Other app on a local port (Docker / Node / etc.)', port: 3000, hint: 'The port your container or app listens on.' },
   static: { label: 'Static files from a folder', folder: '/var/www/example.com', hint: 'The folder nginx serves files from.' },
 };
@@ -77,11 +48,27 @@ function newSite(ctx) {
   const name = input({ placeholder: 'example.com' });
   const type = select(Object.entries(SITE_TYPES).map(([id, t]) => [id, t.label]), 'nextjs');
   const port = input({ placeholder: '3000' });
+  const wsPort = input({ placeholder: '3001' });
+  const wsPath = input({ placeholder: '/ws', value: '/ws' });
+  const wsPortHint = h('div', { class: 'hint' });
+  const appFolder = input({ placeholder: '/opt/apps/myapp' });
+  const wsFolder = input({ placeholder: '/opt/apps/myapp-ws' });
+  const appFolderField = field('App folder', appFolder, 'Where the app runs from on the server. Optional: nginx only needs the port, but it is saved in the config and used when setting up auto-deploy.');
   const rootDir = input({});
   const portHint = h('div', { class: 'hint' });
   const rootHint = h('div', { class: 'hint' });
-  const portField = h('div', { class: 'field' }, h('label', null, 'Local port'), port, portHint);
+  const portLabel = h('label', null, 'Local port');
+  const portField = h('div', { class: 'field' }, portLabel, port, portHint);
   const rootField = h('div', { class: 'field' }, h('label', null, 'Folder'), rootDir, rootHint);
+  const wsFields = h(
+    'div',
+    null,
+    h('div', { class: 'field' }, h('label', null, 'WebSocket server port (Node.js)'), wsPort, wsPortHint),
+    field('WebSocket server folder', wsFolder, 'Where the Node.js WebSocket server runs from on the server. Optional, saved in the config like the app folder.'),
+    field('WebSocket path', wsPath, 'Browsers connect to wss://your-domain + this path, e.g. /ws, or /socket.io/ for Socket.IO.')
+  );
+  let wsPortTouched = false;
+  wsPort.addEventListener('input', () => (wsPortTouched = true));
   const https = h('input', { type: 'checkbox', id: 'site-https' });
   let nameTouched = false;
   let portTouched = false;
@@ -97,6 +84,10 @@ function newSite(ctx) {
     const t = SITE_TYPES[type.value];
     portField.classList.toggle('hidden', !t.port);
     rootField.classList.toggle('hidden', !t.folder);
+    wsFields.classList.toggle('hidden', !t.ws);
+    appFolderField.classList.toggle('hidden', !t.ws);
+    portLabel.textContent = t.ws ? 'App port' : 'Local port';
+    if (t.ws) syncWsPort();
     rootDir.placeholder = t.folder || '';
     rootHint.textContent = t.folder ? t.hint : '';
     if (!t.port) return;
@@ -113,15 +104,37 @@ function newSite(ctx) {
       if (waiting.length) {
         const [w, ...rest] = waiting;
         port.value = String(w.port);
+        if (t.ws) syncWsPort();
         portHint.textContent = `${w.port} is the port of the deploy project “${w.name}”, which has no site yet.${rest.length ? ` Also waiting: ${rest.map((x) => `${x.name} on ${x.port}`).join(', ')}.` : ''} For an unrelated app use ${r.port}, the next free port. ${t.hint}`;
         return;
       }
       port.value = String(r.port);
+      if (t.ws) syncWsPort();
       portHint.textContent = `${r.port} is the next free port${r.inUse.length ? ` (${r.inUse.join(', ')} ${r.inUse.length === 1 ? 'is' : 'are'} taken)` : ''}. ${t.hint}`;
     } catch (e) {
       if (mine === lookup) portHint.textContent = `Could not check which ports are free (${e.message}). ${t.hint}`;
     }
   }
+  // The WebSocket server's port: the next free one that is not the app's port.
+  let wsLookup = 0;
+  async function syncWsPort() {
+    const t = SITE_TYPES[type.value];
+    wsPortHint.textContent = t.wsHint;
+    if (wsPortTouched) return;
+    const mine = ++wsLookup;
+    const appPort = Number(port.value) || t.port;
+    try {
+      let r = await api('nginx:nextPort', { from: appPort + 1 });
+      if (mine !== wsLookup || wsPortTouched) return;
+      if (r.port === Number(port.value)) r = await api('nginx:nextPort', { from: r.port + 1 });
+      if (mine !== wsLookup || wsPortTouched) return;
+      wsPort.value = String(r.port);
+      wsPortHint.textContent = `${r.port} is the next free port after the app’s. ${t.wsHint}`;
+    } catch (e) {
+      if (mine === wsLookup) wsPortHint.textContent = `Could not check which ports are free (${e.message}). ${t.wsHint}`;
+    }
+  }
+  port.addEventListener('change', () => SITE_TYPES[type.value].ws && syncWsPort());
   type.addEventListener('change', sync);
   sync();
 
@@ -132,6 +145,8 @@ function newSite(ctx) {
       field('Config file name', name),
       field('Type', type),
       portField,
+      appFolderField,
+      wsFields,
       rootField,
       h('div', { class: 'check' }, https, h('label', { for: 'site-https' }, 'Get an HTTPS certificate straight away (certbot; the domains must already point at this server)')),
     ],
@@ -149,13 +164,21 @@ function newSite(ctx) {
               // Left blank, the server picks the next free port itself.
               upstreamPort: t.port && port.value.trim() ? Math.trunc(Number(port.value)) || 0 : undefined,
               root: t.folder ? rootDir.value.trim() : undefined,
+              wsPort: t.ws && wsPort.value.trim() ? Math.trunc(Number(wsPort.value)) || 0 : undefined,
+              wsPath: t.ws ? wsPath.value.trim() || '/ws' : undefined,
+              appFolder: t.ws ? appFolder.value.trim() || undefined : undefined,
+              wsFolder: t.ws ? wsFolder.value.trim() || undefined : undefined,
               https: https.checked || undefined,
             });
             return created || {};
           });
           if (!r) return;
           close();
-          const where = r.upstreamPort ? ` It forwards to port ${r.upstreamPort}: make the app listen there.` : '';
+          const where = r.wsPort
+            ? ` It forwards to the app on port ${r.upstreamPort} and ${r.wsPath} to the WebSocket server on port ${r.wsPort}: make each listen there.`
+            : r.upstreamPort
+              ? ` It forwards to port ${r.upstreamPort}: make the app listen there.`
+              : '';
           if (https.checked) toast(r.https ? `Site created with HTTPS.${where}` : `Site created over HTTP, but the certificate request failed (see the output below).${where}`, r.https ? 'ok' : 'error');
           else toast(`Site created.${where} Use “Get certificate” to add HTTPS.`, 'ok');
           ctx.refresh();
@@ -182,7 +205,7 @@ async function getCert(site, ctx) {
 export function render(root, ctx) {
   root.append(
     pageHead(
-      'Domains & nginx',
+      'Sites',
       button('Test config', (b) =>
         act(b, async () => {
           const r = await api('nginx:test');
@@ -214,7 +237,13 @@ export function render(root, ctx) {
       return h(
         'tr',
         null,
-        h('td', null, h('div', null, site.name), h('div', { class: 'muted mono' }, site.kind === 'conf.d' ? 'conf.d' : 'sites-available')),
+        h(
+          'td',
+          null,
+          h('button', { class: 'link', type: 'button', title: 'Open the config editor', onclick: () => editSite(site, ctx) }, site.name),
+          h('div', { class: 'muted mono' }, site.kind === 'conf.d' ? 'conf.d' : 'sites-available'),
+          hasDraft(site.name, site.kind) && badge('Unsaved edits', 'warn')
+        ),
         h(
           'td',
           null,
@@ -227,7 +256,13 @@ export function render(root, ctx) {
               })
             : h('span', { class: 'muted' }, '(default / no server_name)')
         ),
-        h('td', { class: 'mono' }, sm.targets.length ? sm.targets.map((t) => h('div', null, t)) : h('span', { class: 'muted' }, '—')),
+        h(
+          'td',
+          { class: 'mono' },
+          sm.targets.length ? sm.targets.map((t) => h('div', null, t)) : h('span', { class: 'muted' }, '—'),
+          sm.folders && sm.folders.app && h('div', { class: 'muted' }, `app in ${sm.folders.app}`),
+          sm.folders && sm.folders.ws && h('div', { class: 'muted' }, `ws in ${sm.folders.ws}`)
+        ),
         h('td', null, certBadge(site)),
         h(
           'td',
@@ -244,6 +279,7 @@ export function render(root, ctx) {
           'td',
           { class: 'actions' },
           button('Edit', () => editSite(site, ctx), 'small'),
+          button('Traffic', () => ctx.go('traffic', false, { name: site.name, kind: site.kind }), 'small'),
           (settings.vultr.hasKey || settings.vultr.fromEnv) && sm.domains.length > 0 && button('Point DNS here', (b) => act(b, () => pointHere(sm.domains, ctx)), 'small'),
           !project &&
             site.name !== 'deploy-agent' &&

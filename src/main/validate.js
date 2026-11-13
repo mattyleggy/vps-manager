@@ -8,6 +8,9 @@ const RULES = {
   projectName: [/^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$/, 'Project name may only contain letters, numbers, dashes and underscores'],
   repo: [/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'Repository must look like owner/name'],
   branch: [/^[A-Za-z0-9][A-Za-z0-9._\/-]{0,99}$/, 'Invalid branch name'],
+  urlPath: [/^\/[A-Za-z0-9._\/~-]*$/, 'Path must start with / and contain only letters, numbers and . _ ~ - /'],
+  aptPackage: [/^[a-z0-9][a-z0-9+.-]{0,99}(:[a-z0-9]+)?$/, 'Not a valid package name'],
+  owner: [/^[a-z_][a-z0-9_-]{0,31}(:[a-z_][a-z0-9_-]{0,31})?$/, 'Owner must be a Linux user, or user:group'],
   absPath: [/^\/[A-Za-z0-9._\/@+-]*$/, 'Path must be absolute and contain no spaces or special characters'],
 };
 

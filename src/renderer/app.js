@@ -1,6 +1,7 @@
-import { h, api, button, reviewModal, icon } from './ui.js';
+import { h, api, button, copyButton, reviewModal, icon } from './ui.js';
 import * as overview from './views/overview.js';
 import * as activity from './views/activity.js';
+import * as instance from './views/instance.js';
 import * as domains from './views/domains.js';
 import * as dns from './views/dns.js';
 import * as docker from './views/docker.js';
@@ -8,24 +9,51 @@ import * as deploys from './views/deploys.js';
 import * as chat from './views/chat.js';
 import * as settings from './views/settings.js';
 import * as progress from './views/progress.js';
+import * as site from './views/site.js';
+import * as repos from './views/repos.js';
+import * as patches from './views/patches.js';
+import * as terminal from './views/terminal.js';
+import * as traffic from './views/traffic.js';
 
 const VIEWS = [
   ['overview', 'Overview', overview, 'Monitor'],
-  ['activity', 'Deploying now', activity, 'Monitor'],
-  ['domains', 'Domains & nginx', domains, 'Network'],
+  ['instance', 'Instance', instance, 'Monitor'],
+  ['activity', 'Deployments', activity, 'Monitor'],
+  ['domains', 'Sites', domains, 'Network'],
   ['dns', 'DNS', dns, 'Network'],
   ['docker', 'Docker', docker, 'Apps'],
   ['deploys', 'Auto-deploy', deploys, 'Apps'],
+  ['repos', 'Repositories', repos, 'Security'],
+  ['patches', 'Server patches', patches, 'Security'],
   ['settings', 'Settings', settings, 'System'],
 ];
+// Pages below a menu screen (reached from it, shown with breadcrumbs): id -> [label, module, parent view].
+const SUBPAGES = {
+  site: ['Edit config', site, 'domains'],
+  traffic: ['Traffic', traffic, 'domains'],
+};
 
-const state = { conn: { connected: false }, view: 'overview' };
+const state = { conn: { connected: false }, view: 'overview', params: {}, pins: [] };
+
+// ---- sites pinned to the menu (saved per server), each opening that site's traffic ----
+const isPinned = (name, kind = 'site') => state.pins.some((p) => p.name === name && p.kind === kind);
+async function togglePin(name, kind = 'site') {
+  state.pins = await api('pins:toggle', { name, kind });
+  renderNav();
+  return state.pins;
+}
+async function loadPins() {
+  state.pins = await api('pins:get').catch(() => []);
+  renderNav();
+}
+/** The pinned site whose traffic is on screen, if any (it is highlighted instead of Sites). */
+const openPin = () => (state.view === 'traffic' ? state.pins.find((p) => p.name === state.params.name && p.kind === (state.params.kind || 'site')) : null);
 const viewEl = document.getElementById('view');
 const navEl = document.getElementById('nav');
 
-// ---- "Deploying now" count in the menu ----
+// ---- "Deployments" count in the menu ----
 // The main process polls the server and sends the count (it also drives the taskbar button);
-// the "Deploying now" screen refreshes faster and reports its own count back.
+// the "Deployments" screen refreshes faster and reports its own count back.
 let activeCount = 0;
 const countBadge = h('span', { class: 'nav-count hidden', title: 'Deploys and builds running now' });
 function setActiveCount(n) {
@@ -64,14 +92,29 @@ function overlayPng(n) {
 function renderNav() {
   let group = null;
   const items = [];
+  const pin = openPin();
   for (const [id, label, , g] of VIEWS) {
     if (g !== group) {
       group = g;
       items.push(h('div', { class: 'nav-group' }, g));
     }
+    const active = id === state.view || (!pin && SUBPAGES[state.view] && SUBPAGES[state.view][2] === id);
     items.push(
-      h('button', { class: id === state.view ? 'active' : '', onclick: () => go(id, true) }, icon(id), h('span', { class: 'nav-label' }, label), id === 'activity' && countBadge)
+      h('button', { class: active ? 'active' : '', onclick: () => go(id, true) }, icon(id), h('span', { class: 'nav-label' }, label), id === 'activity' && countBadge)
     );
+    // Pinned sites sit right under Sites, in the Network group.
+    if (id === 'domains' && state.conn.connected) {
+      for (const p of state.pins) {
+        items.push(
+          h(
+            'button',
+            { class: `nav-pin ${p === pin ? 'active' : ''}`, title: `${p.name}: recent traffic`, onclick: () => go('traffic', true, { name: p.name, kind: p.kind }) },
+            icon('traffic', 16),
+            h('span', { class: 'nav-label' }, p.name)
+          )
+        );
+      }
+    }
   }
   navEl.replaceChildren(...items);
   const c = state.conn;
@@ -80,15 +123,27 @@ function renderNav() {
   pill.replaceChildren(icon('server', 14), h('span', { class: `dot ${c.connected ? 'ok' : ''}` }), h('span', { class: 'conn-text' }, c.connected ? `${c.username}@${c.host}` : 'Not connected'));
 }
 
-function go(id, fromNav = false) {
+// Clean-up registered by the screen on show (editors to dispose, streams to stop), run when it is left.
+let leaving = [];
+
+/** Show a screen. `params` picks what a sub-page shows (e.g. which site); a re-render keeps them. */
+function go(id, fromNav = false, params) {
+  for (const fn of leaving.splice(0)) {
+    try {
+      fn();
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+  if (params !== undefined || id !== state.view) state.params = params || {};
   state.view = id;
   renderNav();
   // Each render gets a fresh root, so a slow render of a view the user has left can't paint over the new one.
   const root = h('div');
   viewEl.replaceChildren(root);
   viewEl.scrollTop = 0;
-  const [, label, mod] = VIEWS.find((v) => v[0] === id);
-  const ctx = { conn: state.conn, go, fromNav, refresh: () => go(state.view) };
+  const [label, mod] = SUBPAGES[id] || VIEWS.find((v) => v[0] === id).slice(1, 3);
+  const ctx = { conn: state.conn, go, fromNav, params: state.params, isPinned, togglePin, refresh: () => go(state.view), onLeave: (fn) => leaving.push(fn) };
   if (!state.conn.connected && id !== 'settings') {
     root.append(
       h('div', { class: 'page-head' }, h('h1', null, label)),
@@ -107,6 +162,7 @@ function go(id, fromNav = false) {
 }
 
 chat.init();
+terminal.init(() => !!state.conn.connected);
 document.getElementById('conn-pill').addEventListener('click', () => go('settings'));
 
 // ---- job drawer: live output of long-running commands ----
@@ -143,6 +199,7 @@ jobToggle.addEventListener('click', () => {
   jobToggle.textContent = jobs.classList.toggle('collapsed') ? 'Show' : 'Hide';
 });
 document.getElementById('job-close').addEventListener('click', () => jobs.classList.add('hidden'));
+document.getElementById('job-copy').replaceWith(Object.assign(copyButton(() => jobOut.textContent, 'Copy', 'small ghost'), { id: 'job-copy', title: 'Copy the output to the clipboard' }));
 
 // The main process asks for approval before it changes anything on the server.
 // A change proposed by the assistant is asked about in its side panel instead of a dialog.
@@ -154,12 +211,14 @@ window.api.on('review', (plan) => {
 window.api.on('conn', (conn) => {
   const was = state.conn.connected;
   state.conn = conn;
+  if (conn.connected && !was) loadPins();
   if (was !== conn.connected) go(conn.connected && state.view === 'settings' ? 'overview' : state.view);
   else renderNav();
 });
 
 (async () => {
   state.conn = await api('conn:status');
+  if (state.conn.connected) await loadPins();
   const s = await api('settings:get');
   go(s.connection.host ? 'overview' : 'settings');
   // Auto-connect on launch when a server is already configured.

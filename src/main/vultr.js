@@ -106,6 +106,12 @@ module.exports = ({ key }) => {
     return `${zonePath(zone)}/records/${id}`;
   };
 
+  const checkId = (id) => {
+    if (!RECORD_ID.test(String(id))) throw new Error(`Not a valid Vultr id: "${id}"`);
+    return String(id);
+  };
+  const instancePath = (id) => `/instances/${checkId(id)}`;
+
   return {
     NAMESERVERS,
     hasKey: () => !!key(),
@@ -122,6 +128,24 @@ module.exports = ({ key }) => {
       return request('PATCH', recordPath(zone, id), rest);
     },
     deleteRecord: (zone, id) => request('DELETE', recordPath(zone, id)),
+
+    // ---- instances (read-only) ----
+    listInstances: () => paged('/instances', 'instances'),
+    instance: (id) => request('GET', instancePath(id)).then((d) => d.instance),
+    /** Daily traffic for about the last month: { 'YYYY-MM-DD': { incoming_bytes, outgoing_bytes } }. */
+    bandwidth: (id) => request('GET', `${instancePath(id)}/bandwidth`).then((d) => d.bandwidth || {}),
+    ipv4: (id) => request('GET', `${instancePath(id)}/ipv4`).then((d) => d.ipv4s || []),
+    ipv6: (id) => request('GET', `${instancePath(id)}/ipv6`).then((d) => d.ipv6s || []),
+    neighbors: (id) => request('GET', `${instancePath(id)}/neighbors`).then((d) => d.neighbors || []),
+    backupSchedule: (id) => request('GET', `${instancePath(id)}/backup-schedule`).then((d) => d.backup_schedule || null),
+    backups: (id) => request('GET', `/backups?instance_id=${encodeURIComponent(checkId(id))}&per_page=100`).then((d) => d.backups || []),
+    snapshots: () => paged('/snapshots', 'snapshots'),
+    plans: () => paged('/plans', 'plans'),
+    regions: () => paged('/regions', 'regions'),
+    firewallGroup: (id) => request('GET', `/firewalls/${checkId(id)}`).then((d) => d.firewall_group),
+    firewallRules: (id) => paged(`/firewalls/${checkId(id)}/rules`, 'firewall_rules'),
+    account: () => request('GET', '/account').then((d) => d.account),
+    pendingCharges: () => request('GET', '/billing/pending-charges').then((d) => d.pending_charges || []),
   };
 };
 

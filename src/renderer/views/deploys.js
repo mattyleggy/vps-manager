@@ -1,4 +1,4 @@
-import { h, api, act, button, badge, modal, field, input, pageHead, table, load, toast, showOutput, copyLine, timeAgo, fmtDuration } from '../ui.js';
+import { h, api, act, button, badge, modal, field, input, pageHead, table, load, toast, showOutput, copyLine, timeAgo, fmtDuration, commitLink } from '../ui.js';
 import { launchModal } from './launch.js';
 
 const DEFAULT_CMD = (branch) => `git pull --ff-only origin ${branch || 'master'} && docker compose up -d --build --remove-orphans`;
@@ -14,7 +14,7 @@ function installForm(status, ctx) {
     h(
       'div',
       { class: 'field-row' },
-      field('Webhook hostname (recommended)', host, 'A (sub)domain pointing at this server. nginx will forward /hooks/ on it to the agent, and you can add HTTPS to it from the Domains page. Leave blank to expose the port directly over plain HTTP instead.'),
+      field('Webhook hostname (recommended)', host, 'A (sub)domain pointing at this server. nginx will forward /hooks/ on it to the agent, and you can add HTTPS to it from the Sites page. Leave blank to expose the port directly over plain HTTP instead.'),
       field('Agent port', port, 'Local port the agent listens on. With no hostname this port is opened in ufw — also allow it in the Vultr firewall if you use one.')
     ),
     h(
@@ -77,7 +77,7 @@ function webhookCard(status, ctx) {
         'div',
         { class: 'warn-box' },
         cfg.public_host
-          ? `This URL is plain HTTP. Requests are still authenticated by the secret, but go to Domains → “deploy-agent” → Get certificate to switch it to HTTPS, then use the https:// URL.`
+          ? `This URL is plain HTTP. Requests are still authenticated by the secret, but go to Sites → “deploy-agent” → Get certificate to switch it to HTTPS, then use the https:// URL.`
           : 'This URL is plain HTTP on a raw port. Requests are still authenticated by the secret, but setting a webhook hostname above (and adding a certificate) is the better setup.'
       )
   );
@@ -289,6 +289,7 @@ function projectsTable(status, ctx) {
 }
 
 function historyTable(status) {
+  const repos = Object.fromEntries(((status.config || {}).projects || []).map((p) => [p.name, p.repo]));
   const rows = status.history.map((e) =>
     h(
       'tr',
@@ -296,7 +297,7 @@ function historyTable(status) {
       h('td', { class: 'nowrap' }, timeAgo(e.started)),
       h('td', null, e.project),
       h('td', null, badge(e.trigger, e.trigger === 'push' ? 'info' : '')),
-      h('td', null, e.commit ? h('span', { class: 'mono' }, `${e.commit.slice(0, 7)} `) : null, h('span', { class: 'muted' }, e.message || '')),
+      h('td', null, e.commit ? [commitLink(repos[e.project], e.commit), ' '] : null, h('span', { class: 'muted' }, e.message || '')),
       h('td', null, e.code === 0 ? badge('Success', 'ok') : badge(`Failed (${e.code})`, 'bad')),
       h('td', { class: 'muted nowrap' }, fmtDuration(e.finished - e.started)),
       h('td', { class: 'actions' }, button('Log', (b) => act(b, async () => showOutput(`${e.project} — ${new Date(e.started * 1000).toLocaleString()}`, await api('deploy:log', { file: e.log }))), 'small'))

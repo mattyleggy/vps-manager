@@ -83,3 +83,30 @@ test('create for Laravel PHP-FPM serves public/ through the newest PHP-FPM socke
   await assert.rejects(ops.run(newOp(), () => fake({ fpm: '' }).nginx.create(input)), /PHP-FPM is not running/);
   await assert.rejects(ops.run(newOp(), () => fake({ fpm: '/run/php/php8.3-fpm.sock' }).nginx.create({ ...input, root: 'relative/path' })), /Path must be absolute/);
 });
+
+test('App + WebSocket template sends the socket path to its own port and the rest to the app', () => {
+  const conf = createNginx.template({ type: 'app-websocket', domains: ['a.com'], upstreamPort: 3000, wsPort: 3001, wsPath: '/socket.io/' });
+  assert.deepStrictEqual(summarize(conf).targets, ['http://127.0.0.1:3001', 'http://127.0.0.1:3000']);
+  for (const line of ['location /socket.io/ {', 'location / {', 'proxy_set_header Upgrade $http_upgrade;', 'proxy_set_header Connection "upgrade";', 'proxy_read_timeout 3600s;']) assert.ok(conf.includes(line), line);
+});
+
+test('create for App + WebSocket picks two different free ports and validates the path', async () => {
+  const run = (input, env = { ports: '3000\n3002\n' }) => ops.run(newOp(), () => fake(env).nginx.create({ name: 'a.com', type: 'app-websocket', domains: 'a.com', ...input }));
+  let r = await run({});
+  assert.deepStrictEqual([r.upstreamPort, r.wsPort, r.wsPath], [3001, 3003, '/ws']);
+  r = await run({ upstreamPort: 4000, wsPort: 4001, wsPath: '/live' });
+  assert.deepStrictEqual([r.upstreamPort, r.wsPort, r.wsPath], [4000, 4001, '/live']);
+  await assert.rejects(run({ upstreamPort: 4000, wsPort: 4000 }), /different ports/);
+  await assert.rejects(run({ wsPath: '/' }), /cannot be "\/"/);
+  await assert.rejects(run({ wsPath: 'ws; deny all' }), /Path must start with \//);
+});
+
+test('App + WebSocket records the app and WebSocket server folders in the config, and they read back', async () => {
+  const conf = createNginx.template({ type: 'app-websocket', domains: ['a.com'], upstreamPort: 3000, wsPort: 3001, appFolder: '/opt/apps/web', wsFolder: '/opt/apps/ws' });
+  assert.deepStrictEqual(summarize(conf).folders, { app: '/opt/apps/web', ws: '/opt/apps/ws' });
+  assert.deepStrictEqual(summarize(createNginx.template({ type: 'app-websocket', domains: ['a.com'], upstreamPort: 3000, wsPort: 3001 })).folders, {});
+  const run = (input) => ops.run(newOp(), () => fake().nginx.create({ name: 'a.com', type: 'app-websocket', domains: 'a.com', ...input }));
+  const r = await run({ appFolder: '/opt/apps/web/', wsFolder: '' });
+  assert.deepStrictEqual([r.appFolder, r.wsFolder], ['/opt/apps/web', undefined]);
+  await assert.rejects(run({ wsFolder: 'relative' }), /Path must be absolute/);
+});

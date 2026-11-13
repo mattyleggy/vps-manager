@@ -21,6 +21,7 @@ const dns = require('dns').promises;
 const net = require('net');
 const { check, port } = require('./validate');
 const { recordBody, zoneFor, TYPES, NAMESERVERS } = require('./vultr');
+const { SIZE_MB, KEEP } = require('./remote/traffic');
 
 const obj = (properties = {}, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 const str = (description, extra = {}) => ({ type: 'string', description, ...extra });
@@ -38,7 +39,11 @@ const COMPOSE_NOTES = {
   start: 'Creates and starts the containers of this project.',
 };
 
-const SITE_KIND = { type: 'string', enum: ['site', 'conf.d'], description: '"site" = /etc/nginx/sites-available (the normal case), "conf.d" = /etc/nginx/conf.d' };
+/** Commands that get the red "read carefully" treatment when the assistant proposes them in Server mode. */
+const DANGEROUS =
+  /\brm\s+-\w*[rf]|\bmkfs|\bdd\s+if=|\b(reboot|shutdown|poweroff|halt|userdel|deluser|wipefs|fdisk|parted)\b|\bchmod\s+-R|\bchown\s+-R|\biptables\s+-F|\bufw\s+(disable|reset|deny)|\bsystemctl\s+(stop|disable|mask)\b|\bapt(-get)?\s+(remove|purge|autoremove)|\bdrop\s+(table|database)\b|\btruncate\b|>\s*\/(etc|boot|var\/lib)\//i;
+
+const SITE_KIND ={ type: 'string', enum: ['site', 'conf.d'], description: '"site" = /etc/nginx/sites-available (the normal case), "conf.d" = /etc/nginx/conf.d' };
 
 /** "https://github.com/owner/name.git" or "git@github.com:owner/name.git" -> "owner/name". */
 const repoSlug = (s) =>
@@ -89,7 +94,26 @@ function launchInput(a, { hasToken, certEmail }) {
   return L;
 }
 
-module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, activity, detect, shellJob, job }) => {
+module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, activity, detect, security, osv, traffic, shellJob, job }) => {
+  // The last repository scan, so reopening the screen (or the assistant asking) doesn't re-run it.
+  let repoScan = null;
+
+  /** Check a repos scan's pinned packages against OSV.dev; OSV being unreachable is reported, not thrown. */
+  async function checkRepos(scan) {
+    const packages = scan.repos.flatMap((r) => r.lockfiles.flatMap((l) => l.packages.map(([name, version]) => ({ ecosystem: l.ecosystem, name, version }))));
+    let hits = new Map();
+    let osvError = null;
+    try {
+      hits = await osv.check(packages);
+    } catch (e) {
+      osvError = `Could not reach OSV.dev: ${e.message}`;
+    }
+    const result = security.withFindings(scan, hits);
+    const checkedAt = Date.now() / 1000;
+    for (const r of result.repos) r.checkedAt = checkedAt;
+    return { result, osvError };
+  }
+
   /** Resolve domains from this PC: does each point at the server ('ok'), elsewhere, or nowhere ('none')? */
   async function dnsStatus(domains, ips) {
     const mine = new Set([...(ips || (await system.info()).ips), ssh.info.host]);
@@ -109,6 +133,73 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
     );
     return out;
   }
+  /**
+   * The Vultr instance this server is, matched by IP (or the given id), with every read-only
+   * detail the API has about it. Each part is fetched on its own so one failure (an API key
+   * without billing access, say) leaves the rest; failures are listed in `errors`.
+   */
+  async function vultrInstance(id) {
+    if (!vultr.hasKey()) return { hasKey: false };
+    const instances = await vultr.listInstances();
+    let inst = id ? instances.find((i) => i.id === id) : null;
+    if (!inst && !id && ssh.connected) {
+      const mine = new Set([ssh.info.host]);
+      if (!net.isIP(ssh.info.host)) (await dns.resolve4(ssh.info.host).catch(() => [])).forEach((a) => mine.add(a));
+      (await system.info().then((s) => s.ips).catch(() => [])).forEach((a) => mine.add(a));
+      inst = instances.find((i) => mine.has(i.main_ip) || mine.has(i.v6_main_ip) || mine.has(i.internal_ip));
+    }
+    const list = instances.map((i) => ({ id: i.id, label: i.label, hostname: i.hostname, main_ip: i.main_ip, region: i.region, plan: i.plan }));
+    if (!inst) return { hasKey: true, matched: false, instances: list };
+    const errors = {};
+    const part = (name, p) =>
+      Promise.resolve()
+        .then(p)
+        .catch((e) => {
+          errors[name] = e.message;
+          return null;
+        });
+    const [full, bw, ipv4, ipv6, neighbors, backupSchedule, backups, snapshots, plans, regions, account, pending, fwGroup, fwRules] = await Promise.all([
+      part('instance', () => vultr.instance(inst.id)),
+      part('bandwidth', () => vultr.bandwidth(inst.id)),
+      part('ipv4', () => vultr.ipv4(inst.id)),
+      part('ipv6', () => vultr.ipv6(inst.id)),
+      part('neighbors', () => vultr.neighbors(inst.id)),
+      part('backupSchedule', () => vultr.backupSchedule(inst.id)),
+      part('backups', () => vultr.backups(inst.id)),
+      part('snapshots', () => vultr.snapshots()),
+      part('plans', () => vultr.plans()),
+      part('regions', () => vultr.regions()),
+      part('account', () => vultr.account()),
+      part('pendingCharges', () => vultr.pendingCharges()),
+      part('firewall', () => (inst.firewall_group_id ? vultr.firewallGroup(inst.firewall_group_id) : null)),
+      part('firewallRules', () => (inst.firewall_group_id ? vultr.firewallRules(inst.firewall_group_id) : [])),
+    ]);
+    const instance = full || inst;
+    const bandwidth = Object.entries(bw || {})
+      .map(([date, v]) => ({ date, in: Number(v.incoming_bytes) || 0, out: Number(v.outgoing_bytes) || 0 }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+    return {
+      hasKey: true,
+      matched: true,
+      instances: list,
+      instance,
+      plan: (plans || []).find((p) => p.id === instance.plan) || null,
+      region: (regions || []).find((r) => r.id === instance.region) || null,
+      bandwidth,
+      ipv4,
+      ipv6,
+      neighbors,
+      backupSchedule,
+      backups,
+      // Snapshots are account-wide; there is no link to the instance they were taken from.
+      snapshots,
+      firewall: fwGroup ? { group: fwGroup, rules: fwRules || [] } : null,
+      account,
+      pendingCharges: pending,
+      errors,
+    };
+  }
+
   /** Who answers for a zone, looked up from this PC: { ns: [...], active: true when it is Vultr }. */
   async function delegation(zone) {
     const ns = (await dns.resolveNs(zone).catch(() => [])).map((n) => n.toLowerCase().replace(/\.$/, '')).sort();
@@ -144,16 +235,173 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
   return [
     // ------------------------------------------------------------------ server
     {
+      // The assistant's escape hatch in Server mode (chat.js gates it by mode). Like every change
+      // it is planned and shown before it runs, so even a read-only command waits for Run.
+      id: 'server:command',
+      change: true,
+      serverMode: true,
+      description:
+        'SERVER MODE ONLY. Run any shell command on the server (through bash -c) and get its exit code and output. Use it for what the other tools do not cover: files, logs, packages, services, firewall, cron, users, troubleshooting. Prefer a dedicated tool when one fits. The user sees every command and must press Run before it runs, read-only ones included, so compose one purposeful command per step rather than many tiny ones. Non-interactive only: no editors, pagers or prompts (use -y, --no-pager, cat, tee, sed -i). Stops after 10 minutes.',
+      input: obj(
+        {
+          command: str('The exact shell command to run. Several commands can be joined with && or ;.'),
+          purpose: str('One short sentence shown to the user as the title of the request, e.g. "Check why php8.3-fpm failed to start".'),
+          asRoot: { type: 'boolean', description: 'Run with sudo (needed for system files, services and packages). Ignored when connected as root.' },
+        },
+        ['command', 'purpose']
+      ),
+      review: ({ command, purpose }) => {
+        const danger = DANGEROUS.test(command);
+        return {
+          title: purpose,
+          detail: danger ? 'This command can delete data, stop services or cut off access to the server. Read it carefully before running it.' : 'A command written by the assistant in Server mode.',
+          danger,
+        };
+      },
+      run: ({ command, purpose, asRoot }) =>
+        job(purpose, async (onData) => {
+          onData(`$ ${command}\n`);
+          return (await ssh.exec(command, { sudo: !!asRoot, onData, what: purpose, timeout: 10 * 60 * 1000 })).code;
+        }),
+      forModel: (r) => ({ exitCode: r.code, output: r.output.replace(/^\$ [^\n]*\n/, '') }),
+    },
+    {
       id: 'system:info',
       description: 'Get server health: hostname, Ubuntu version, uptime, load, memory, disk, IP addresses, and whether nginx, docker, ufw and the deploy agent are running. Use for any "how is the server doing" question.',
       input: obj(),
       run: () => system.info(),
     },
     {
+      id: 'system:sample',
+      description: 'Read raw kernel counters once (CPU jiffies, memory, network bytes, disk operations, load, pressure). Two samples a few seconds apart give usage rates; for a one-off health check prefer system_info.',
+      input: obj(),
+      run: () => system.sample(),
+    },
+    {
+      id: 'system:history',
+      description: 'The last 24 hours of CPU (used, I/O wait, steal), memory and swap use, network and disk throughput, disk operations and load average, from sysstat on the server; one entry per sample (usually every 2 or 10 minutes). installed/enabled false means sysstat is not set up to collect (see system_enableHistory). Use for "was the server busy last night?" and similar.',
+      input: obj(),
+      run: () => system.history(),
+      forModel: (r) => {
+        const p = r.points || {};
+        const n = (p.t || []).length;
+        const stat = (k) => (n ? { avg: +(p[k].reduce((a, b) => a + b, 0) / n).toFixed(2), max: Math.max(...p[k]) } : null);
+        return { installed: r.installed, enabled: r.enabled, collecting: r.collecting, interval: r.interval, cpus: r.cpus, samples: n, from: n ? new Date(p.t[0] * 1000).toISOString() : null, cpuPercent: stat('cpu'), iowaitPercent: stat('iowait'), stealPercent: stat('steal'), memPercent: stat('mem'), swapPercent: stat('swap'), netInBytesPerSec: stat('rx'), netOutBytesPerSec: stat('tx'), diskReadBytesPerSec: stat('rd'), diskWriteBytesPerSec: stat('wr'), load1: stat('l1') };
+      },
+    },
+    {
+      id: 'system:enableHistory',
+      change: true,
+      description: 'Install sysstat (if missing) and set it to record CPU, memory, disk and network usage every 2 minutes, so the 24-hour graphs on the Instance screen (and system_history) have data. Only when the user wants usage history.',
+      input: obj(),
+      review: () => ({
+        title: 'Keep 24 hours of usage history (sysstat)',
+        detail: 'Installs the sysstat package from Ubuntu if it is missing, turns its collector on and sets it to take a sample every 2 minutes. It keeps about a month of daily files in /var/log/sysstat (a few MB). The graphs fill in from now on; nothing from before is available.',
+      }),
+      run: () => shellJob('Enable sysstat history', system.ENABLE_HISTORY),
+    },
+    {
+      id: 'vultr:instance',
+      description: "Everything the Vultr API reports about the Vultr instance this server runs on: plan, region, status, OS, IPs, monthly cost and bandwidth allowance, daily bandwidth for about the last month, backups and snapshots, firewall group and rules, other instances on the same host, and the account's balance and pending charges. The instance is matched by IP address; id picks one explicitly. Read-only.",
+      input: obj({ id: str('Vultr instance id; omit to match this server by IP') }),
+      run: ({ id } = {}) => vultrInstance(id),
+      forModel: (r) => (r.instance ? { ...r, bandwidth: r.bandwidth && r.bandwidth.slice(-7) } : r),
+    },
+    {
       id: 'activity:list',
       description: 'List what is being deployed or built on the server right now: deploy-agent deploys in progress (project, trigger, commit, current command, log path), Docker builds, compose up/pull/build, image pulls, git clone/pull, certbot, apt/dpkg and incoming file uploads (whether started by the agent, the app or by hand over SSH), containers still starting or restarting, and the last few finished deploys. Use for "is anything deploying?", "is the build still running?" or "what is the server doing?".',
       input: obj(),
       run: () => activity.list(),
+    },
+    {
+      id: 'activity:history',
+      description: 'The full history of deploy-agent deploys on the server, newest first (project, repository, trigger, commit, message, start/finish time, exit code, log path and whether that log is still kept), plus a breakdown per GitHub repository (projects, number of deploys, succeeded, failed, last deploy, average duration). repo filters to one repository: pass a "key" from the repos list (the owner/name, or "project:<name>" for a removed project). Read-only.',
+      input: obj({
+        repo: str('Repository key from repos[].key; omit for all repositories'),
+        offset: { type: 'integer', description: 'Skip this many deploys (paging)' },
+        limit: { type: 'integer', description: 'How many deploys to return (default 100, max 1000)' },
+      }),
+      run: ({ repo, offset, limit } = {}) => activity.history({ repo: repo || null, offset, limit }),
+      forModel: (r) => ({ ...r, entries: r.entries.slice(0, 40) }),
+    },
+    // ------------------------------------------------------------------ security
+    {
+      id: 'security:repos',
+      description:
+        'Security check of the git repositories cloned on the server: finds every checkout under /opt, /srv, /var/www, /home, /root (and every deploy project folder), reads its lockfiles (package-lock.json, yarn.lock, pnpm-lock.yaml, composer.lock, Pipfile.lock, poetry.lock, uv.lock, requirements*.txt, Cargo.lock, Gemfile.lock, go.mod) and checks each pinned package version against the OSV.dev vulnerability database. Returns each repo (path, origin, branch, last commit, uncommitted changes) with its known vulnerabilities (advisory id, severity, package, installed version, fixed versions). The result is cached; refresh: true scans again. Read-only.',
+      input: obj({ refresh: { type: 'boolean', description: 'Scan again instead of returning the last result' } }),
+      async run({ refresh } = {}) {
+        if (repoScan && !refresh && repoScan.host === ssh.info.host) return repoScan;
+        const { result, osvError } = await checkRepos(await security.repos());
+        const out = { ...result, osvError, scannedAt: Date.now() / 1000, host: ssh.info.host };
+        if (!osvError) repoScan = out;
+        return out;
+      },
+      forModel: (r) => ({
+        ...r,
+        repos: r.repos.map((x) => ({ ...x, findings: x.findings.slice(0, 40).map(({ id, severity, package: pkg, version, fixed, summary, files }) => ({ id, severity, package: pkg, version, fixed, summary, files })), moreFindings: Math.max(0, x.findings.length - 40) })),
+      }),
+    },
+    {
+      id: 'security:repo',
+      description: 'Scan one git checkout on the server again (its lockfiles, checked against OSV.dev) and update the cached security_repos result for it. Returns that repo with its known vulnerabilities. Read-only.',
+      input: obj({ path: str('Absolute path of the checkout, as security_repos lists it') }, ['path']),
+      async run({ path } = {}) {
+        if (typeof path !== 'string' || !path.startsWith('/')) throw new Error('path must be the absolute path of a checkout on the server');
+        const scan = await security.repos(path);
+        if (scan.error) throw new Error(scan.error);
+        const { result, osvError } = await checkRepos(scan);
+        const repo = result.repos[0];
+        if (osvError) return { repo, osvError };
+        if (repoScan && repoScan.host === ssh.info.host) {
+          const i = repoScan.repos.findIndex((r) => r.path === repo.path);
+          if (i >= 0) repoScan.repos[i] = repo;
+          else repoScan.repos.push(repo);
+        }
+        return { repo, osvError: null };
+      },
+    },
+    {
+      id: 'system:updates',
+      description:
+        'Patches the server needs: every package apt can upgrade (installed and available version, source package, and whether it comes from a -security pocket), packages a plain upgrade keeps back, held packages, when the package lists were last refreshed, whether a reboot is required (and which packages asked for it), the running vs newest installed kernel, and whether unattended-upgrades is on. Read-only; run system_aptRefresh first if the lists are old.',
+      input: obj(),
+      run: () => security.updates(),
+    },
+    {
+      id: 'system:aptRefresh',
+      change: true,
+      description: 'Run apt-get update so the list of available updates (system_updates) is current. Changes nothing installed.',
+      input: obj(),
+      review: () => ({ title: 'Refresh the package lists (apt-get update)', detail: 'Downloads the latest package indexes from the Ubuntu mirrors. Nothing is installed or upgraded.' }),
+      run: () => shellJob('apt-get update', security.refreshCommand()),
+    },
+    {
+      id: 'system:upgrade',
+      change: true,
+      description:
+        'Install package updates on the server. With packages, upgrades only those (already-installed) packages, which is how to apply just the security updates from system_updates; without, runs apt-get upgrade for everything (it never removes packages or installs new ones, so kept-back packages stay). Existing config files are kept. Services using upgraded libraries are restarted by needrestart where installed.',
+      input: obj({ packages: { type: 'array', items: { type: 'string' }, description: 'Package names to upgrade; omit for all' } }),
+      review: ({ packages } = {}) => ({
+        title: packages && packages.length ? `Install ${packages.length} package update${packages.length === 1 ? '' : 's'}` : 'Install all available updates (apt-get upgrade)',
+        detail: `${packages && packages.length ? `Upgrades: ${packages.join(', ')}. ` : ''}Your changed config files are kept. Services that use upgraded libraries may restart briefly; a kernel or libc update needs a reboot to take effect.`,
+      }),
+      run: ({ packages } = {}) => {
+        const list = (packages || []).map((p) => check('aptPackage', p));
+        return shellJob(list.length ? `Upgrade ${list.length} package${list.length === 1 ? '' : 's'}` : 'apt-get upgrade', security.upgradeCommand(list));
+      },
+    },
+    {
+      id: 'system:reboot',
+      change: true,
+      description: 'Reboot the server, e.g. after a kernel update when system_updates reports a reboot is required. Every site and container is down until it is back up (usually under a minute). Only when the user asks for it.',
+      input: obj(),
+      review: () => ({
+        title: 'Reboot the server',
+        detail: 'Every site, container and the deploy agent stop until the server is back up, usually within a minute. The app loses its connection; press Connect in Settings (or the server pill) once it is back.',
+        danger: true,
+      }),
+      run: () => shellJob('Reboot', security.rebootCommand()),
     },
     {
       id: 'github:repos',
@@ -358,6 +606,45 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
       },
     },
     {
+      id: 'nginx:traffic',
+      description: "Recent HTTP requests to one nginx site, read from its access log: totals by status class (2xx/3xx/4xx/5xx), requests per minute, busiest paths and client IPs, and the latest requests. Use when the user asks about a site's traffic, visitors, errors it is returning or whether it is getting requests. If the result says shared: true, the site has no access_log of its own and writes to the server-wide log; with grep: true only lines naming one of its domains were kept (usually in the Referer), so direct visits without a referrer are missed. nginx_siteLog gives it its own log.",
+      input: obj(
+        {
+          name: str('Config file name, as returned by nginx_list'),
+          kind: SITE_KIND,
+          lines: { type: 'integer', description: 'How many of the most recent matching log lines to read (default 1000, max 5000)' },
+          match: { type: 'string', enum: ['site', 'all'], description: 'Only for a site on the shared log: "site" (default) keeps lines naming one of its domains, "all" keeps every line of the shared log' },
+        },
+        ['name']
+      ),
+      run: (a) => traffic.read(a),
+      forModel: (r) => ({ ...r, stats: { ...r.stats, perMinute: undefined }, entries: r.entries.slice(0, 40), entriesShown: Math.min(40, r.entries.length) }),
+    },
+    {
+      id: 'nginx:siteLog',
+      change: true,
+      description: "Give a site its own access log with a size cap: adds `access_log /var/log/nginx/sites/<name>.access.log;` to each server block of its config that has none (then tests and reloads nginx; the old file is restored if the test fails), and sets up logrotate to rotate it, checked hourly, once it passes maxSizeMb, keeping `keep` old compressed copies. On a site that already has that log, it only changes the cap. Use when nginx_traffic reports shared: true and the user wants per-site traffic, or to change how big a site's log may get.",
+      input: obj(
+        {
+          name: str('Config file name, as returned by nginx_list'),
+          kind: SITE_KIND,
+          maxSizeMb: { type: 'integer', minimum: SIZE_MB.min, maximum: SIZE_MB.max, description: `Rotate the log once it is bigger than this many MB (default ${SIZE_MB.default})` },
+          keep: { type: 'integer', minimum: KEEP.min, maximum: KEEP.max, description: `How many rotated, compressed old copies to keep; 0 just empties the log (default ${KEEP.default})` },
+        },
+        ['name']
+      ),
+      review: (a) => {
+        const size = a.maxSizeMb || SIZE_MB.default;
+        const keep = a.keep == null ? KEEP.default : a.keep;
+        const old = keep ? `the oldest of ${keep} compressed old cop${keep === 1 ? 'y is' : 'ies is'} deleted` : 'no old copy is kept';
+        return {
+          title: `Give ${a.name} its own access log, up to ${size} MB`,
+          detail: `Requests to this site are written to /var/log/nginx/sites/${a.name}.access.log from now on (if they are not already); earlier requests stay in the shared log. Once a day and every hour, logrotate checks its size: past ${size} MB it is rotated and ${old}. The size can overshoot a little between checks.`,
+        };
+      },
+      run: (a) => traffic.addSiteLog(a),
+    },
+    {
       id: 'nginx:test',
       description: 'Run nginx -t and return its output. Read-only; use to diagnose a config problem.',
       input: obj(),
@@ -366,13 +653,17 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
     {
       id: 'nginx:create',
       change: true,
-      description: 'Create and enable a new nginx site from a template. Types: "nextjs" (Next.js app on a local port), "laravel" (Laravel served by a container or Octane on a local port), "laravel-fpm" (Laravel on PHP-FPM installed on this server, served from its public/ folder), "proxy" (any other app on a local port) and "static" (files from a folder). For the port types, omit upstreamPort to use the next free port on the server; the result reports which port was chosen, and the app must then be made to listen on it. Set https to also get a Let\'s Encrypt certificate in the same step. Use when the user wants to add a site or domain.',
+      description: 'Create and enable a new nginx site from a template. Types: "nextjs" (Next.js app on a local port), "laravel" (Laravel served by a container or Octane on a local port), "laravel-fpm" (Laravel on PHP-FPM installed on this server, served from its public/ folder), "proxy" (any other app on a local port), "app-websocket" (an app on one local port plus a separate Node.js WebSocket server on another, reached under wsPath on the same domain) and "static" (files from a folder). For the port types, omit upstreamPort to use the next free port on the server; the result reports which port was chosen, and the app must then be made to listen on it. Set https to also get a Let\'s Encrypt certificate in the same step. Use when the user wants to add a site or domain.',
       input: obj(
         {
           name: str('Config file name, conventionally the main domain, e.g. example.com'),
-          type: { type: 'string', enum: ['proxy', 'nextjs', 'laravel', 'laravel-fpm', 'static'], description: 'nextjs / laravel / proxy = forward to an app on upstreamPort; laravel-fpm = PHP-FPM on this server serving root/public; static = serve files from root' },
+          type: { type: 'string', enum: ['proxy', 'nextjs', 'laravel', 'laravel-fpm', 'static', 'app-websocket'], description: 'nextjs / laravel / proxy = forward to an app on upstreamPort; app-websocket = app on upstreamPort plus a Node.js WebSocket server on wsPort under wsPath; laravel-fpm = PHP-FPM on this server serving root/public; static = serve files from root' },
           domains: str('Space-separated domain names, e.g. "example.com www.example.com"'),
-          upstreamPort: { type: 'integer', description: 'Local port the app listens on (types proxy, nextjs, laravel). Omit to use the next free port: from 3000 for proxy and nextjs, from 8000 for laravel' },
+          upstreamPort: { type: 'integer', description: 'Local port the app listens on (types proxy, nextjs, laravel, app-websocket). Omit to use the next free port: from 3000 for proxy and nextjs, from 8000 for laravel' },
+          wsPort: { type: 'integer', description: 'Local port the Node.js WebSocket server listens on (type app-websocket). Omit to use the next free port after the app port' },
+          wsPath: str('URL path forwarded to the WebSocket server (type app-websocket), e.g. "/ws" or "/socket.io/". Default "/ws"'),
+          appFolder: str('Absolute folder the app runs from on the server (type app-websocket, optional; recorded in the config and used when setting up auto-deploy)'),
+          wsFolder: str('Absolute folder the Node.js WebSocket server runs from (type app-websocket, optional)'),
           root: str('Absolute folder (types static and laravel-fpm). For laravel-fpm give the app folder, e.g. /opt/apps/myapp; /public is added'),
           https: { type: 'boolean', description: "Also get a Let's Encrypt certificate right after creating the site (domains must already point at this server; needs the Let's Encrypt email in Settings). Default false" },
         },
@@ -393,13 +684,13 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
         const result = await job(`Create site ${site.name} with HTTPS`, async (log) => {
           created = await nginx.create(site);
           const certDomains = String(site.domains).split(/[\s,]+/).filter((d) => d && !d.startsWith('*.'));
-          log(`Site ${site.name} created${created.upstreamPort ? `, forwarding to port ${created.upstreamPort}` : ''}.\nRequesting an HTTPS certificate for ${certDomains.join(', ')}...\n`);
+          log(`Site ${site.name} created${created.upstreamPort ? `, forwarding to port ${created.upstreamPort}` : ''}${created.wsPort ? ` and ${created.wsPath} to port ${created.wsPort}` : ''}.\nRequesting an HTTPS certificate for ${certDomains.join(', ')}...\n`);
           const c = await ssh.exec(nginx.certbotCommand({ domains: certDomains, email }), {
             sudo: true,
             onData: log,
             what: `Get a Let's Encrypt certificate for ${certDomains.join(', ')} and switch the site to HTTPS`,
           });
-          if (c.code !== 0) log(`\nThe site is up over HTTP but the certificate request failed. Once DNS points at this server, use "Get certificate" on the Domains screen.\n`);
+          if (c.code !== 0) log(`\nThe site is up over HTTP but the certificate request failed. Once DNS points at this server, use "Get certificate" on the Sites screen.\n`);
           return c.code;
         });
         return { ...created, https: result.code === 0, ...result };
@@ -586,7 +877,7 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
           const off = L.certDomains.filter((d) => dnsOf[d] && dnsOf[d].status !== 'ok');
           if (off.length) {
             lines.push(
-              `Heads-up: ${off.map((d) => `${d} ${dnsOf[d].status === 'none' ? 'has no DNS record yet' : `points at ${dnsOf[d].addrs.join(', ')}, not at this server`}`).join('; ')}. Unless that is a proxy in front of this server, the certificate step will fail; the site will still be up over HTTP and you can use "Get certificate" on the Domains screen later.`
+              `Heads-up: ${off.map((d) => `${d} ${dnsOf[d].status === 'none' ? 'has no DNS record yet' : `points at ${dnsOf[d].addrs.join(', ')}, not at this server`}`).join('; ')}. Unless that is a proxy in front of this server, the certificate step will fail; the site will still be up over HTTP and you can use "Get certificate" on the Sites screen later.`
             );
           }
         }
@@ -623,7 +914,7 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
               what: `Get a Let's Encrypt certificate for ${L.certDomains.join(', ')} and switch the site to HTTPS`,
             });
             if (c.code !== 0) {
-              log(`\nThe site is live at http://${L.certDomains[0]} but the certificate request failed. Once DNS points at this server, use "Get certificate" on the Domains screen.\n`);
+              log(`\nThe site is live at http://${L.certDomains[0]} but the certificate request failed. Once DNS points at this server, use "Get certificate" on the Sites screen.\n`);
               return c.code;
             }
           }

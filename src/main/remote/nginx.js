@@ -62,7 +62,7 @@ function filePath(name, kind) {
   return `${kind === 'conf.d' ? CONFD : AVAILABLE}/${name}`;
 }
 
-function template({ type, domains, upstreamPort, root, hideDotfiles, fpmSocket }) {
+function template({ type, domains, upstreamPort, root, hideDotfiles, fpmSocket, wsPort, wsPath = '/ws', appFolder, wsFolder }) {
   const names = domains.join(' ');
   if (type === 'static') {
     // A folder that is a git checkout must never serve its .git directory (or .env files).
@@ -157,6 +157,48 @@ ${dotfiles}
 }
 `;
   }
+  if (type === 'app-websocket') {
+    // An app on one port plus a separate Node.js WebSocket server (ws, Socket.IO, ...) on another,
+    // reached through a path on the same domain. WebSocket connections are long-lived, so the
+    // socket location gets long timeouts and no buffering. nginx only needs the ports; the folders
+    // each one runs from are recorded as comments, read back by nginx-parse (summary.folders).
+    const notes = [appFolder && `# vps-manager app-folder ${appFolder}`, wsFolder && `# vps-manager ws-folder ${wsFolder}`].filter(Boolean);
+    return `${notes.length ? `${notes.join('\n')}\n` : ''}server {
+    listen 80;
+    listen [::]:80;
+    server_name ${names};
+
+    client_max_body_size 50m;
+
+    location ${wsPath} {
+        proxy_pass http://127.0.0.1:${wsPort};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:${upstreamPort};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+    }
+}
+`;
+  }
   return `server {
     listen 80;
     listen [::]:80;
@@ -180,7 +222,9 @@ ${dotfiles}
 }
 
 // Site types whose app listens on a local port, and where the search for a free port starts.
-const PORT_TYPES = { proxy: 3000, nextjs: 3000, laravel: 8000 };
+const PORT_TYPES = { proxy: 3000, nextjs: 3000, laravel: 8000, 'app-websocket': 3000 };
+// Where the search for a free WebSocket server port starts (app-websocket sites).
+const WS_PORT_FROM = 3001;
 
 // Every port that is taken or spoken for: listening sockets, ports nginx configs already
 // forward to (an app that is down still owns its port), and ports published by any Docker
@@ -267,10 +311,13 @@ ${TEST_AND_RELOAD(`mv "$bak" ${q(f)}; if [ $was = 1 ]; then ln -sfn ${q(f)} ${q(
     /**
      * Create and enable a site from a template. Types: proxy, nextjs, laravel (app on a local
      * port; the next free port is chosen when upstreamPort is omitted), laravel-fpm and static
-     * (served from a folder). Resolves { name, type, upstreamPort?, root? }.
+     * (served from a folder). app-websocket forwards to an app on upstreamPort and a Node.js
+     * WebSocket server on wsPort under wsPath (default /ws); either port is picked when omitted.
+     * appFolder / wsFolder (optional) record where each runs from, as comments in the config.
+     * Resolves { name, type, upstreamPort?, wsPort?, wsPath?, root? }.
      */
-    async create({ name, type, domains, upstreamPort, root, hideDotfiles, reserved }) {
-      if (!['proxy', 'nextjs', 'laravel', 'laravel-fpm', 'static'].includes(type)) throw new Error(`Unknown site type "${type}"`);
+    async create({ name, type, domains, upstreamPort, root, hideDotfiles, reserved, wsPort, wsPath, appFolder, wsFolder }) {
+      if (!['proxy', 'nextjs', 'laravel', 'laravel-fpm', 'static', 'app-websocket'].includes(type)) throw new Error(`Unknown site type "${type}"`);
       check('siteName', name);
       const list = (Array.isArray(domains) ? domains : String(domains).split(/[\s,]+/)).filter(Boolean).map((d) => check('domain', d));
       if (!list.length) throw new Error('Enter at least one domain');
@@ -282,6 +329,15 @@ ${TEST_AND_RELOAD(`mv "$bak" ${q(f)}; if [ $was = 1 ]; then ln -sfn ${q(f)} ${q(
       } else {
         spec.root = check('absPath', root).replace(/\/+$/, '');
       }
+      if (type === 'app-websocket') {
+        spec.wsPath = check('urlPath', wsPath == null || wsPath === '' ? '/ws' : wsPath);
+        if (spec.wsPath === '/') throw new Error('The WebSocket path cannot be "/" - that is where the app is served');
+        spec.wsPort = wsPort == null ? (await api.nextPort(WS_PORT_FROM, { reserved: [...(reserved || []), spec.upstreamPort] })).port : port(wsPort);
+        if (spec.wsPort === spec.upstreamPort) throw new Error('The app and the WebSocket server need different ports');
+        const folder = (v) => (v == null || String(v).trim() === '' ? undefined : check('absPath', v).replace(/\/+$/, '') || '/');
+        spec.appFolder = folder(appFolder);
+        spec.wsFolder = folder(wsFolder);
+      }
       if (type === 'laravel-fpm') {
         // Laravel is served from its public/ folder; accept either the app folder or public/ itself.
         if (!/\/public$/.test(spec.root)) spec.root += '/public';
@@ -291,7 +347,7 @@ ${TEST_AND_RELOAD(`mv "$bak" ${q(f)}; if [ $was = 1 ]; then ln -sfn ${q(f)} ${q(
       }
       await api.save({ name, kind: 'site', content: template(spec) });
       await api.enable(name);
-      return { name, type, upstreamPort: spec.upstreamPort, root: spec.root };
+      return { name, type, upstreamPort: spec.upstreamPort, wsPort: spec.wsPort, wsPath: spec.wsPath, appFolder: spec.appFolder, wsFolder: spec.wsFolder, root: spec.root };
     },
 
     async test() {

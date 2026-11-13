@@ -95,6 +95,8 @@ function cleanProject(input) {
   };
   if (p.path.split('/').filter(Boolean).length < 2) throw new Error('Deploy path must be at least two levels deep, e.g. /opt/apps/myapp');
   if (input.ssh_key) p.ssh_key = check('absPath', input.ssh_key);
+  // Who owns the checkout (user or user:group). Omitted: the agent's default, matt:matt.
+  if (input.owner) p.owner = check('owner', input.owner);
   // The port the site forwards to; on the first clone the agent writes it to .env as APP_PORT.
   if (input.app_port != null) p.app_port = port(input.app_port);
   return p;
@@ -464,7 +466,7 @@ cat "$k.pub"`,
       const p = ((await readConfig()).projects || []).find((x) => x.name === name);
       if (!p) throw new Error(`Project "${name}" not found`);
       const cmd = p.command || `git pull --ff-only origin ${p.branch || 'master'} && docker compose up -d --build --remove-orphans`;
-      return `The agent will run this as root in ${p.path}:\n\n${cmd}\n\nIf ${p.path} has no git checkout yet, it first clones ${p.repo} (branch ${p.branch || 'master'}) into it and, unless the repository has its own .env, creates .env from .env.example${p.app_port ? ` with APP_PORT=${p.app_port}` : ''}.`;
+      return `The agent will run this as root in ${p.path}:\n\n${cmd}\n\nIf ${p.path} has no git checkout yet, it first clones ${p.repo} (branch ${p.branch || 'master'}) into it and, unless the repository has its own .env, creates .env from .env.example${p.app_port ? ` with APP_PORT=${p.app_port}` : ''}.\n\nWhat it writes (the clone, .env, files a git pull changes) is then handed to ${p.owner || 'matt:matt'} instead of staying owned by root.`;
     },
 
     /** Ports saved on deploy projects: [{ name, port }]. Empty when the agent is not installed. */

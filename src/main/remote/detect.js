@@ -111,7 +111,11 @@ if inodes:
             except Exception:
                 pass
 
-# 3. Folders nginx serves directly.
+# 3. Folders recorded in the site config for the app and the WebSocket server.
+for d in IN.get('declared', []):
+    found.append({'via': 'declared', 'role': d['role'], 'port': d.get('port'), 'path': d['path']})
+
+# 4. Folders nginx serves directly.
 for r in IN['roots']:
     found.append({'via': 'root', 'path': r})
 
@@ -138,7 +142,7 @@ function githubSlug(url) {
   return m ? `${m[1]}/${m[2]}` : null;
 }
 
-const SOURCE_RANK = { docker: 0, process: 1, root: 2 };
+const SOURCE_RANK = { docker: 0, process: 1, declared: 2, root: 3 };
 const projectName = (s) =>
   String(s || '')
     .replace(/[^A-Za-z0-9_-]+/g, '-')
@@ -169,7 +173,9 @@ function suggest(found, { site, ports = [], existing = [] }) {
       ? `the Docker container ${best.container}${best.composeProject ? ` (compose project ${best.composeProject})` : ''}, which publishes port ${best.port}`
       : best.via === 'process'
         ? `${best.exe} (pid ${best.pid}), which listens on port ${best.port}`
-        : 'the folder nginx serves';
+        : best.via === 'declared'
+          ? `the ${best.role === 'ws' ? 'WebSocket server' : 'app'} folder recorded in the site config`
+          : 'the folder nginx serves';
   const dir = best.gitRoot || best.path;
   note('info', `Found ${dir} through ${where}.`);
 
@@ -229,6 +235,10 @@ function deployCommand(f, branch, notes) {
     notes.push({ kind: 'warn', text: `The app runs as ${f.exe} outside Docker. The command below only updates the code${f.packageJson ? ' and builds it' : ''}; add the restart (e.g. “pm2 reload <app>” or “systemctl restart <service>”).` });
     return f.packageJson ? `${pull} && npm ci && npm run build --if-present` : pull;
   }
+  if (f.via === 'declared' && f.packageJson) {
+    notes.push({ kind: 'warn', text: 'The command below updates the code and builds it; add the restart for the app and the WebSocket server (e.g. “pm2 reload <app>” or “systemctl restart <service>”).' });
+    return `${pull} && npm ci && npm run build --if-present`;
+  }
   return pull; // static files: updating the checkout is the whole deploy
 }
 
@@ -236,6 +246,18 @@ function uniqueName(name, existing) {
   const taken = new Set(existing);
   if (!taken.has(name)) return name;
   for (let i = 2; ; i++) if (!taken.has(`${name}-${i}`)) return `${name}-${i}`;
+}
+
+/**
+ * Folders an "App + WebSocket" site records for its app and WebSocket server, with the port each
+ * one serves (the WebSocket location is the first proxy target, the app's the second).
+ */
+function declaredFolders(summary) {
+  const f = (summary && summary.folders) || {};
+  const ports = siteTargets(summary && summary.targets).ports;
+  const ws = ports.length > 1 ? ports[0] : null;
+  const app = ports.length > 1 ? ports[1] : ports[0] || null;
+  return [f.app && { role: 'app', path: f.app, port: app }, f.ws && { role: 'ws', path: f.ws, port: ws }].filter(Boolean);
 }
 
 /** Ports and folders an nginx site's targets point at (only local ports count). */
@@ -256,7 +278,8 @@ module.exports = (ssh, nginx, deploy) => ({
     const s = (data.sites || []).find((x) => x.name === name && (x.kind || 'site') === kind);
     if (!s) throw new Error(`nginx site "${name}" not found`);
     const { ports, roots } = siteTargets(s.summary.targets);
-    const found = ports.length || roots.length ? await ssh.python(script({ ports, roots }), { sudo: true }) : [];
+    const declared = declaredFolders(s.summary);
+    const found = ports.length || roots.length || declared.length ? await ssh.python(script({ ports, roots, declared }), { sudo: true }) : [];
     const status = await deploy.status().catch(() => null);
     const projects = (status && status.config && status.config.projects) || [];
     const r = suggest(found, { site: name, ports, existing: projects.map((p) => p.name) });
@@ -268,4 +291,5 @@ module.exports = (ssh, nginx, deploy) => ({
 module.exports.suggest = suggest;
 module.exports.githubSlug = githubSlug;
 module.exports.siteTargets = siteTargets;
+module.exports.declaredFolders = declaredFolders;
 module.exports.script = script;

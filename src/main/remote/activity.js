@@ -104,7 +104,16 @@ try:
 except Exception:
     pass
 
-print(json.dumps({'now': now, 'parents': parents, 'procs': procs, 'deploys': deploys, 'containers': containers, 'history': history}))
+# Each project's GitHub repository, so a finished deploy's commit can link to it.
+repos = {}
+try:
+    for p in json.load(open('/etc/deploy-agent/config.json')).get('projects', []):
+        if p.get('name') and p.get('repo'):
+            repos[p['name']] = p['repo']
+except Exception:
+    pass
+
+print(json.dumps({'now': now, 'parents': parents, 'procs': procs, 'deploys': deploys, 'containers': containers, 'history': history, 'repos': repos}))
 `;
 
 /** Command-line patterns, most specific first. `null` kind = ignore (housekeeping, not a deploy). */
@@ -218,8 +227,100 @@ function summarize(raw) {
     active,
     settling: settling(raw.containers),
     dockerAvailable: raw.containers != null,
-    recent: (raw.history || []).slice(0, 6),
+    recent: (raw.history || []).slice(0, 6).map((e) => ({ ...e, repo: (raw.repos || {})[e.project] || null })),
     now: raw.now,
+  };
+}
+
+// The whole deploy history. The agent appends one line per deploy to history.jsonl and never
+// trims it (only the per-project logs are pruned, to the newest 30), so this goes back to the
+// first deploy. Bounded to the newest HISTORY_MAX lines so a very old server stays quick.
+const HISTORY_MAX = 5000;
+const HISTORY_SCRIPT = String.raw`
+import json, os
+LOGS = '${LOGS}'
+entries = []
+try:
+    lines = open(os.path.join(LOGS, 'history.jsonl'), errors='replace').read().splitlines()
+    total = len(lines)
+    for l in lines[-${HISTORY_MAX}:]:
+        try:
+            if l.strip():
+                entries.append(json.loads(l))
+        except Exception:
+            pass
+except Exception:
+    total = 0
+projects = {}
+try:
+    for p in json.load(open('/etc/deploy-agent/config.json')).get('projects', []):
+        if p.get('name'):
+            projects[p['name']] = {'repo': p.get('repo') or None, 'branch': p.get('branch') or None}
+except Exception:
+    pass
+# Which logs are still on disk: older ones are pruned by the agent.
+logs = []
+for e in entries:
+    if e.get('log') and os.path.isfile(e['log']):
+        logs.append(e['log'])
+print(json.dumps({'entries': entries, 'total': total, 'projects': projects, 'logs': logs}))
+`;
+
+/**
+ * Shape the raw history for the Deployments screen: every deploy newest first, each with its
+ * repository, and a per-repository breakdown. A project that no longer exists keeps its deploys,
+ * grouped under its own name. `repo` filters to one repository (its key from `repos`).
+ * Pure: exported for tests.
+ */
+function summarizeHistory(raw, { repo = null, offset = 0, limit = 100 } = {}) {
+  const projects = raw.projects || {};
+  const logs = new Set(raw.logs || []);
+  const keyOf = (project) => (projects[project] && projects[project].repo) || `project:${project}`;
+  const all = (raw.entries || [])
+    .filter((e) => e && e.project)
+    .map((e) => ({ ...e, repo: (projects[e.project] && projects[e.project].repo) || null, repoKey: keyOf(e.project), logKept: !!e.log && logs.has(e.log) }))
+    .sort((a, b) => (b.started || 0) - (a.started || 0));
+
+  const groups = new Map();
+  for (const e of all) {
+    let g = groups.get(e.repoKey);
+    if (!g) {
+      g = { key: e.repoKey, repo: e.repo, removed: !projects[e.project], projects: [], deploys: 0, succeeded: 0, failed: 0, lastStarted: null, lastCode: null, totalTime: 0, timed: 0 };
+      groups.set(e.repoKey, g);
+    }
+    if (!g.projects.includes(e.project)) g.projects.push(e.project);
+    g.deploys++;
+    if (e.code === 0) g.succeeded++;
+    else g.failed++;
+    if (g.lastStarted == null) {
+      g.lastStarted = e.started || null; // `all` is newest first
+      g.lastCode = e.code;
+    }
+    if (e.finished && e.started && e.finished >= e.started) {
+      g.totalTime += e.finished - e.started;
+      g.timed++;
+    }
+  }
+  // Configured repositories with no deploys yet are listed too, so every repo can be picked.
+  for (const [name, p] of Object.entries(projects)) {
+    const key = keyOf(name);
+    if (!groups.has(key)) groups.set(key, { key, repo: p.repo || null, removed: false, projects: [name], deploys: 0, succeeded: 0, failed: 0, lastStarted: null, lastCode: null, totalTime: 0, timed: 0 });
+    else if (!groups.get(key).projects.includes(name)) groups.get(key).projects.push(name);
+  }
+  const repos = [...groups.values()]
+    .map(({ totalTime, timed, ...g }) => ({ ...g, avgTime: timed ? totalTime / timed : null }))
+    .sort((a, b) => (b.lastStarted || 0) - (a.lastStarted || 0) || a.key.localeCompare(b.key));
+
+  const filtered = repo ? all.filter((e) => e.repoKey === repo) : all;
+  const off = Math.max(0, Math.trunc(offset) || 0);
+  const lim = Math.min(1000, Math.max(1, Math.trunc(limit) || 100));
+  return {
+    entries: filtered.slice(off, off + lim),
+    matching: filtered.length,
+    offset: off,
+    repos,
+    // More deploys on record than were read (only the newest HISTORY_MAX are).
+    truncated: (raw.total || 0) > all.length && (raw.total || 0) > HISTORY_MAX,
   };
 }
 
@@ -227,6 +328,10 @@ module.exports = (ssh) => ({
   async list() {
     return summarize(await ssh.python(SCRIPT, { sudo: true, timeout: 20000 }));
   },
+  async history(opts = {}) {
+    return summarizeHistory(await ssh.python(HISTORY_SCRIPT, { sudo: true, timeout: 30000 }), opts);
+  },
 });
 module.exports.summarize = summarize;
+module.exports.summarizeHistory = summarizeHistory;
 module.exports.classify = classify;

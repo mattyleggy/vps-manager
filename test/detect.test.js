@@ -101,3 +101,10 @@ test('a checkout is preferred over a folder that is not one, and the other is me
   assert.strictEqual(r.project.path, '/srv/shop');
   assert.deepStrictEqual(r.others, ['/var/www/old']);
 });
+
+test('declaredFolders pairs each recorded folder with its port', () => {
+  const { declaredFolders } = require('../src/main/remote/detect');
+  const summary = { targets: ['http://127.0.0.1:3001', 'http://127.0.0.1:3000'], folders: { app: '/opt/web', ws: '/opt/ws' } };
+  assert.deepStrictEqual(declaredFolders(summary), [{ role: 'app', path: '/opt/web', port: 3000 }, { role: 'ws', path: '/opt/ws', port: 3001 }]);
+  assert.deepStrictEqual(declaredFolders({ targets: ['http://127.0.0.1:3000'], folders: {} }), []);
+});

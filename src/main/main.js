@@ -3,12 +3,14 @@ const { app, BrowserWindow, ipcMain, dialog, clipboard, shell, Menu, Tray, nativ
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const { StringDecoder } = require('string_decoder');
 
 const store = require('./store');
 const { Ssh, ops, newOp, planning } = require('./ssh');
 const { validate } = require('./schema');
 const defineActions = require('./actions');
 const createChat = require('./chat');
+const createNginxAi = require('./nginx-ai');
 
 // One copy at a time: starting the app again (Start menu, or a second login launch) brings
 // the running window forward instead of opening another one.
@@ -34,6 +36,9 @@ const deploy = require('./remote/deploy')(ssh, nginx, github);
 const activity = require('./remote/activity')(ssh);
 const detect = require('./remote/detect')(ssh, nginx, deploy);
 const vultr = require('./vultr')({ key: () => store.vultrKey() });
+const security = require('./remote/security')(ssh);
+const osv = require('./osv')();
+const traffic = require('./remote/traffic')(ssh, nginx);
 
 let win = null;
 let tray = null;
@@ -71,7 +76,7 @@ const shellJob = (title, cmd, { read = false, what } = {}) =>
   });
 
 // ---- actions: everything the app can do on the server (see actions.js) ----
-const actions = defineActions({ ssh, store, system, nginx, docker, deploy, github, vultr, activity, detect, shellJob, job });
+const actions = defineActions({ ssh, store, system, nginx, docker, deploy, github, vultr, activity, detect, security, osv, traffic, shellJob, job });
 const actionsById = new Map(actions.map((a) => [a.id, a]));
 
 // ---- review before apply ----
@@ -119,6 +124,31 @@ async function reviewed(action, input, origin) {
   }, origin.chat);
   if (!approved) return { ok: false, cancelled: true, error: 'Cancelled' };
   op.mode = 'apply';
+  // A change the assistant proposed streams its output into the assistant panel, on the step
+  // that proposed it. Chunks are batched so a chatty command doesn't flood IPC.
+  let flushLog = null;
+  if (origin.chat) {
+    let pending = '';
+    let timer = null;
+    flushLog = () => {
+      clearTimeout(timer);
+      timer = null;
+      if (pending) send('chat', { type: 'log', id: origin.chat, text: pending });
+      pending = '';
+    };
+    op.onOutput = (text) => {
+      pending += text;
+      if (!timer) timer = setTimeout(flushLog, 60);
+    };
+  }
+  try {
+    return await applyReviewed(action, input, op, meta);
+  } finally {
+    if (flushLog) flushLog();
+  }
+}
+
+async function applyReviewed(action, input, op, meta) {
   if (!action.progress) return { ok: true, data: await ops.run(op, () => action.run(input)) };
 
   // Multi-step actions show each approved step as it runs, finishes or fails.
@@ -151,12 +181,25 @@ async function runAction(id, input, origin = {}) {
   return action.change ? reviewed(action, data, origin) : { ok: true, data: await action.run(data) };
 }
 
+// Saved conversations (see chats.js); currentChat is the one the panel is showing, once saved.
+const chats = require('./chats')(() => path.join(app.getPath('userData'), 'chats'));
+let currentChat = null;
+
 const chat = createChat({
   actions,
   runAction,
   emit: (event) => send('chat', event),
   apiKey: () => store.aiKey(),
   serverLabel: () => (ssh.info ? `${ssh.info.username}@${ssh.info.host}` : null),
+});
+
+// The config editor's "write it with AI": produces text only, which the user then saves (and reviews) as usual.
+const nginxAi = createNginxAi({
+  client: createChat.client,
+  describeError: createChat.describeError,
+  apiKey: () => store.aiKey(),
+  emit: (event) => send('nginx-gen', event),
+  listSites: async () => (await nginx.list()).sites || [],
 });
 
 function defaultKeyPath() {
@@ -183,6 +226,9 @@ const handlers = {
     store.update(patch);
     if (patch && patch.app) syncLoginItem();
   },
+  /** Sites pinned to the menu, per server: [{ name, kind }]. */
+  'pins:get': () => store.pins(store.hostKeyId(store.get().connection)),
+  'pins:toggle': ({ name, kind = 'site' } = {}) => store.togglePin(store.hostKeyId(store.get().connection), { name, kind }),
   'conn:status': connStatus,
   'conn:pickKey': async () => {
     const r = await dialog.showOpenDialog(win, {
@@ -206,7 +252,7 @@ const handlers = {
   'conn:disconnect': () => ssh.disconnect(),
   'conn:forgetHostKey': () => store.forgetHostKey(store.hostKeyId(store.get().connection)),
 
-  'chat:send': ({ text }) => chat.send(String(text || '')),
+  'chat:send': ({ text, mode }) => chat.send(String(text || ''), { mode: mode === 'server' ? 'server' : 'agent' }),
   'chat:stop': () => {
     chat.stop();
     cancelChatReviews();
@@ -214,6 +260,74 @@ const handlers = {
   'chat:reset': () => {
     chat.reset();
     cancelChatReviews();
+    currentChat = null;
+  },
+  /** Saved conversations, newest first: [{ id, title, server, updatedAt }]. */
+  'chat:list': () => chats.list(),
+  /** Reopen a saved conversation: returns its transcript, and the model continues with its context. */
+  'chat:open': ({ id } = {}) => {
+    const c = chats.read(id);
+    chat.load(c.messages);
+    cancelChatReviews();
+    currentChat = { id: c.id, createdAt: c.createdAt, title: c.title };
+    return { id: c.id, title: c.title, mode: c.mode, items: Array.isArray(c.items) ? c.items : [] };
+  },
+  /** Called by the panel after each turn with its transcript; the model history is added here. */
+  'chat:save': ({ items, mode } = {}) => {
+    if (!Array.isArray(items) || !items.length || !chat.history.length) return currentChat && currentChat.id;
+    const first = items.find((i) => i && i.kind === 'user');
+    const title = (currentChat && currentChat.title) || (first ? String(first.text).replace(/\s+/g, ' ').trim().slice(0, 80) : 'Chat');
+    const saved = chats.write({
+      ...(currentChat || {}),
+      title,
+      server: ssh.info ? `${ssh.info.username}@${ssh.info.host}` : '',
+      mode: mode === 'server' ? 'server' : 'agent',
+      messages: chat.history,
+      items,
+    });
+    currentChat = { id: saved.id, createdAt: saved.createdAt, title };
+    return saved.id;
+  },
+  'chat:delete': ({ id } = {}) => {
+    chats.remove(id);
+    if (currentChat && currentChat.id === id) currentChat = null;
+  },
+
+  'nginx:generate': (input) => {
+    if (!ssh.connected) throw new Error('Not connected to the server');
+    return nginxAi.generate(input || {});
+  },
+  'nginx:generateStop': () => nginxAi.stop(),
+  /** The Monaco editor's web worker script, whose file name carries a content hash. */
+  'monaco:worker': () => {
+    const dir = path.join(__dirname, '..', '..', 'node_modules', 'monaco-editor', 'min', 'vs', 'assets');
+    const file = fs.readdirSync(dir).find((n) => /^editor\.worker-[\w-]+\.js$/.test(n));
+    return file ? `vs/assets/${file}` : null;
+  },
+
+  // ---- terminal panel: an interactive shell on the server ----
+  'term:open': async ({ cols, rows } = {}) => {
+    const size = (n, d) => Math.min(1000, Math.max(2, Math.trunc(Number(n)) || d));
+    const stream = await ssh.shell({ cols: size(cols, 80), rows: size(rows, 24) });
+    const id = ++termSeq;
+    terms.set(id, stream);
+    const decoder = new StringDecoder('utf8');
+    const out = (d) => send('term', { id, type: 'data', data: decoder.write(d) });
+    stream.on('data', out);
+    stream.stderr.on('data', out);
+    stream.on('close', () => {
+      terms.delete(id);
+      send('term', { id, type: 'exit' });
+    });
+    return { id, target: `${ssh.info.username}@${ssh.info.host}` };
+  },
+  'term:resize': ({ id, cols, rows } = {}) => {
+    const t = terms.get(id);
+    if (t) t.setWindow(Math.max(2, Math.trunc(rows) || 24), Math.max(2, Math.trunc(cols) || 80), 0, 0);
+  },
+  'term:close': ({ id } = {}) => {
+    const t = terms.get(id);
+    if (t) t.close();
   },
 
   'clipboard:write': (text) => clipboard.writeText(String(text)),
@@ -229,6 +343,13 @@ const handlers = {
     return shell.openExternal(url);
   },
 };
+
+const terms = new Map(); // id -> ssh2 shell channel
+let termSeq = 0;
+ipcMain.on('term:write', (_e, id, data) => {
+  const t = terms.get(id);
+  if (t && typeof data === 'string') t.write(data);
+});
 
 ipcMain.handle('rpc', async (_event, channel, payload) => {
   try {
@@ -248,7 +369,7 @@ ssh.on('closed', () => {
 
 // ---- deploys in progress: the menu count and the app's taskbar button ----
 // Polled here rather than in the page, so it keeps going while the window is minimised or
-// hidden (when the taskbar is all there is to look at). The "Deploying now" screen refreshes
+// hidden (when the taskbar is all there is to look at). The "Deployments" screen refreshes
 // faster and reports its own count, which resets this poll's clock.
 const ACTIVITY_POLL_MS = 10000;
 let activeCount = 0;
@@ -343,7 +464,11 @@ function createWindow() {
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   // The UI is local-only: never navigate away or open child windows.
   win.webContents.on('will-navigate', (e) => e.preventDefault());
-  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  // Links in the config editor's help (the nginx documentation) open in the user's browser.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https:\/\/nginx\.org\//.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
   win.webContents.on('before-input-event', (_e, input) => {
     if (input.type === 'keyDown' && input.key === 'F12') win.webContents.toggleDevTools();
   });

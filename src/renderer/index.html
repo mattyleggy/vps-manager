@@ -2,20 +2,22 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; worker-src 'self'" />
     <title>VPS Manager</title>
+    <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <header id="titlebar">
       <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">VPS Manager</span></div>
       <button id="conn-pill" class="conn-pill" type="button" title="Connection settings"></button>
+      <button id="terminal-toggle" class="btn small" type="button" title="Terminal on the server (Ctrl+`)">Terminal</button>
       <button id="assistant-toggle" class="btn small" type="button" title="Show or hide the assistant">Assistant</button>
     </header>
     <div id="shell">
       <aside id="sidebar">
         <nav id="nav"></nav>
-        <div class="sidebar-foot"><kbd>F12</kbd> dev tools</div>
+        <div class="sidebar-foot"><kbd>Ctrl</kbd>+<kbd>`</kbd> terminal <span class="spacer"></span> <kbd>F12</kbd> dev tools</div>
       </aside>
       <main>
         <div id="view"></div>
@@ -24,11 +26,13 @@
             <span id="job-status" class="dot"></span>
             <span id="job-title"></span>
             <span class="spacer"></span>
+            <button id="job-copy" class="btn small ghost" title="Copy the output to the clipboard">Copy</button>
             <button id="job-toggle" class="btn small ghost">Hide</button>
             <button id="job-close" class="btn small ghost">Close</button>
           </header>
           <pre id="job-out"></pre>
         </section>
+        <section id="terminal" class="terminal hidden" aria-label="Terminal"></section>
       </main>
       <aside id="assistant" class="hidden" aria-label="Assistant"></aside>
     </div>

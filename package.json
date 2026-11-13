@@ -13,6 +13,9 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.8.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "monaco-editor": "0.57.0",
     "ssh2": "^1.16.0"
   },
   "build": {
@@ -22,7 +25,9 @@
     "files": [
       "src/**/*",
       "build/icon.png",
-      "package.json"
+      "package.json",
+      "!node_modules/monaco-editor/{dev,esm}/**",
+      "!node_modules/monaco-editor/min/vs/**/*.map"
     ],
     "win": {
       "target": "nsis",
