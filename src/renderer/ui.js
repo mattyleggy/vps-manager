@@ -198,11 +198,13 @@ export function pageHead(title, ...actions) {
   return h('div', { class: 'page-head' }, h('h1', null, title), h('span', { class: 'spacer' }), actions);
 }
 
-export function table(headers, rows, emptyText) {
-  if (!rows.length) return h('div', { class: 'table-wrap' }, h('div', { class: 'empty' }, emptyText));
+/** `fit`: never taller than the visible view, so the table's own scrollbars are always on screen. */
+export function table(headers, rows, emptyText, { fit = false } = {}) {
+  const cls = fit ? 'table-wrap fit' : 'table-wrap';
+  if (!rows.length) return h('div', { class: cls }, h('div', { class: 'empty' }, emptyText));
   return h(
     'div',
-    { class: 'table-wrap' },
+    { class: cls },
     h('table', null, h('thead', null, h('tr', null, headers.map((t) => h('th', null, t)))), h('tbody', null, rows))
   );
 }

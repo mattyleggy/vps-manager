@@ -292,7 +292,7 @@ export function render(root, ctx) {
       .catch(() => {});
 
     return [
-      table(['Config', 'Domains', 'Serves', 'TLS', 'Status', ''], rows, 'No nginx sites found.'),
+      table(['Config', 'Domains', 'Serves', 'TLS', 'Status', ''], rows, 'No nginx sites found.', { fit: true }),
       h('div', { class: 'hint muted section' }, 'Dot next to a domain: green = DNS points at this server, amber = points elsewhere (e.g. behind a proxy), red = no DNS record. Hover for details.'),
     ];
   });

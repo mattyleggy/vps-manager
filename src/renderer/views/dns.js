@@ -139,7 +139,7 @@ function renderZone(zone, root, ctx) {
       );
     return [
       info && !info.active && nameserverNote(zones.nameservers, info),
-      table(['Type', 'Name', 'Value', 'TTL', ''], rows, 'This zone has no records yet.'),
+      table(['Type', 'Name', 'Value', 'TTL', ''], rows, 'This zone has no records yet.', { fit: true }),
     ];
   });
 }
@@ -205,7 +205,7 @@ export function render(root, ctx) {
       )
     );
     return [
-      table(['Domain', 'Nameservers', ''], rows, 'No domains on Vultr DNS yet. Use “Add domain”.'),
+      table(['Domain', 'Nameservers', ''], rows, 'No domains on Vultr DNS yet. Use “Add domain”.', { fit: true }),
       data.zones.length > 0 && h('div', { class: 'hint muted section' }, 'Click a domain to see and edit its records.'),
       data.zones.some((z) => !z.active) && h('div', { class: 'section' }, nameserverNote(data.nameservers)),
     ];
