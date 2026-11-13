@@ -99,7 +99,12 @@ function historyRow(e, showRepo) {
     'tr',
     null,
     h('td', { class: 'muted', title: when(e.started) }, timeAgo(e.finished || e.started), h('div', { class: 'muted' }, when(e.started))),
-    h('td', null, e.project, showRepo && e.repo && h('div', { class: 'muted mono' }, e.repo), e.message && h('div', { class: 'muted' }, e.message)),
+    h(
+      'td',
+      null,
+      h('div', { class: 'deploy-source' }, e.project, showRepo && e.repo && [h('span', { class: 'muted', 'aria-label': 'deployed from' }, '←'), h('span', { class: 'muted mono' }, e.repo)]),
+      e.message && h('div', { class: 'muted' }, e.message)
+    ),
     h('td', null, badge(e.code === 0 ? 'Succeeded' : 'Failed', e.code === 0 ? 'ok' : 'bad')),
     h('td', { class: 'muted' }, e.trigger || '', e.commit && ' ', e.commit && commitLink(e.repo, e.commit, 8)),
     h('td', { class: 'muted' }, e.finished && e.started ? fmtDuration(e.finished - e.started) : '—'),
@@ -167,12 +172,6 @@ function historySection() {
       h(
         'div',
         { class: 'section' },
-        h('div', { class: 'section-head' }, h('h2', null, 'By repository'), h('span', { class: 'muted' }, 'click a row to see only its deploys')),
-        reposTable(d.repos, pick)
-      ),
-      h(
-        'div',
-        { class: 'section' },
         h(
           'div',
           { class: 'section-head' },
@@ -188,6 +187,12 @@ function historySection() {
           table(['When', 'Project', 'Result', 'Trigger', 'Took', ''], d.entries.map((e) => historyRow(e, !picked)), picked ? 'No deploys of this repository yet.' : 'No deploys from the deploy agent yet.')
         ),
         more && h('div', { class: 'stat-action' }, more)
+      ),
+      h(
+        'div',
+        { class: 'section' },
+        h('div', { class: 'section-head' }, h('h2', null, 'By repository'), h('span', { class: 'muted' }, 'click a row to show only its deploys in the history above')),
+        reposTable(d.repos, pick)
       )
     );
   }
