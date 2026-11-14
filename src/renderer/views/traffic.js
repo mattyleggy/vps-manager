@@ -53,7 +53,151 @@ function rateChart({ start, values }) {
   );
 }
 
-function topTable(title, rows, total, mono = true) {
+// The access log has no session ID, so a visit is a run of requests from one client (IP + user
+// agent) with no gap longer than this, the same rule web analytics tools use.
+const VISIT_GAP_MS = 30 * 60000;
+const PRIVATE_IP = /^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|::1$|f[cd])/i;
+
+/** One client's entries (any order) -> visits, newest first, each with its requests oldest first. */
+function visitsOf(entries) {
+  const sorted = [...entries].sort((a, b) => (a.time || 0) - (b.time || 0));
+  const open = new Map(); // user agent -> visit in progress
+  const visits = [];
+  for (const e of sorted) {
+    let v = open.get(e.agent);
+    if (!v || (e.time != null && v.end != null && e.time - v.end > VISIT_GAP_MS)) {
+      v = { agent: e.agent, start: e.time, end: e.time, requests: [] };
+      open.set(e.agent, v);
+      visits.push(v);
+    }
+    v.requests.push(e);
+    if (e.time != null) v.end = e.time;
+  }
+  visits.forEach((v, i) => (v.id = i + 1));
+  return visits.reverse();
+}
+
+function countBy(items, key) {
+  const m = new Map();
+  for (const it of items) {
+    const k = key(it);
+    m.set(k, (m.get(k) || 0) + 1);
+  }
+  return [...m].sort((a, b) => b[1] - a[1]).map(([k, count]) => ({ key: k, count }));
+}
+
+const when = (ms, now) => (ms == null ? '—' : now - ms > 86400000 ? `${day(ms)} ${clock(ms)}` : clock(ms));
+
+/**
+ * Everything the loaded log says about one client IP: totals, user agents, paths and its visits.
+ * `focus` (an entry) opens the visit it belongs to. onFilter(ip) narrows the page to this client.
+ */
+function clientDialog(ip, data, { focus, onFilter } = {}) {
+  const mine = data.entries.filter((e) => e.ip === ip);
+  const visits = visitsOf(mine);
+  const now = data.now;
+  const times = mine.map((e) => e.time).filter((t) => t != null);
+  const errors = mine.filter((e) => e.status >= 400).length;
+  const bytes = mine.reduce((n, e) => n + e.bytes, 0);
+
+  const host = h('span', { class: 'muted' }, 'Looking up host name…');
+  if (PRIVATE_IP.test(ip)) {
+    host.replaceChildren('Private network address: usually a proxy, load balancer or container in front of nginx, so the real visitor IP is not in this log.');
+  } else {
+    api('net:reverseDns', { ip })
+      .then((r) => host.replaceChildren(r.names.length ? h('span', { class: 'mono' }, r.names.join(', ')) : 'No reverse DNS name.'))
+      .catch(() => host.replaceChildren('Reverse DNS lookup failed.'));
+  }
+
+  const list = (title, rows, mono) =>
+    h(
+      'div',
+      { class: 'card traffic-top' },
+      h('div', { class: 'chart-title' }, title),
+      h(
+        'div',
+        { class: 'top-list' },
+        rows.slice(0, 8).map((r) => {
+          const fill = h('i');
+          fill.style.width = `${Math.max(2, (r.count / rows[0].count) * 100)}%`;
+          return h('div', { class: 'top-row', title: r.key || '—' }, h('span', { class: mono ? 'mono top-key' : 'top-key' }, r.key || '—'), h('span', { class: 'top-bar' }, fill), h('b', null, String(r.count)));
+        })
+      )
+    );
+
+  const requestRows = (reqs) =>
+    table(
+      ['Time', 'Request', 'Status', 'Size', 'Referer'],
+      [...reqs].reverse().map((e) =>
+        h(
+          'tr',
+          { class: e === focus ? 'focus-row' : '' },
+          h('td', { class: 'mono muted nowrap' }, when(e.time, now)),
+          h('td', { class: 'mono req-cell', title: `${e.method} ${e.path}` }, e.method && h('span', { class: 'method' }, e.method), ' ', e.path),
+          h('td', null, badge(String(e.status), statusKind(e.status))),
+          h('td', { class: 'muted nowrap' }, fmtBytes(e.bytes)),
+          h('td', { class: 'muted ua-cell', title: e.referer }, e.referer || '—')
+        )
+      ),
+      'No requests.',
+      { fit: true }
+    );
+
+  const visitList = h(
+    'div',
+    { class: 'visit-list' },
+    visits.map((v) => {
+      const errs = v.requests.filter((e) => e.status >= 400).length;
+      const pages = new Set(v.requests.map((e) => e.path.split('?')[0])).size;
+      const detail = h('div', { class: 'visit-detail hidden' });
+      const head = h(
+        'button',
+        { type: 'button', class: 'visit-head', 'aria-expanded': 'false' },
+        h('span', { class: 'mono visit-id' }, `#${v.id}`),
+        h('span', { class: 'mono nowrap' }, when(v.start, now)),
+        h('span', { class: 'muted nowrap' }, v.start != null && v.end > v.start ? fmtDuration(Math.max(1, (v.end - v.start) / 1000)) : 'single hit'),
+        h('span', { class: 'nowrap' }, `${v.requests.length} req · ${pages} path${pages === 1 ? '' : 's'}`),
+        errs ? badge(`${errs} error${errs === 1 ? '' : 's'}`, 'warn') : h('span'),
+        h('span', { class: 'mono muted visit-entry', title: v.requests[0].path }, v.requests[0].path),
+        h('span', { class: 'muted ua-cell', title: v.agent }, v.agent || '—')
+      );
+      const toggle = (open) => {
+        if (open && !detail.firstChild) detail.append(requestRows(v.requests));
+        detail.classList.toggle('hidden', !open);
+        head.setAttribute('aria-expanded', String(open));
+      };
+      head.addEventListener('click', () => toggle(detail.classList.contains('hidden')));
+      if (focus && v.requests.includes(focus)) setTimeout(() => (toggle(true), detail.querySelector('.focus-row')?.scrollIntoView({ block: 'nearest' })));
+      return h('div', { class: 'visit' }, head, detail);
+    })
+  );
+
+  modal({
+    title: h('span', null, 'Client ', h('span', { class: 'mono' }, ip)),
+    wide: true,
+    body: h(
+      'div',
+      { class: 'client-drill' },
+      h('div', { class: 'field' }, host),
+      h(
+        'div',
+        { class: 'grid traffic-stats' },
+        stat('Requests', String(mine.length), `${pct(mine.length, data.entries.length)} of the loaded log`),
+        stat('Visits', String(visits.length), 'no gap over 30 min'),
+        stat('Errors', pct(errors, mine.length), `${errors} 4xx/5xx`, errors ? 'text-warn' : ''),
+        stat('Data sent', fmtBytes(bytes), ''),
+        stat('First seen', times.length ? when(Math.min(...times), now) : '—', ''),
+        stat('Last seen', times.length ? `${fmtDuration(Math.max(0, (now - Math.max(...times)) / 1000))} ago` : '—', '')
+      ),
+      h('div', { class: 'client-grid section-gap' }, list('User agents', countBy(mine, (e) => e.agent), false), list('Paths', countBy(mine, (e) => e.path.split('?')[0]), true)),
+      h('div', { class: 'section-head section-gap' }, h('h2', null, 'Visits'), h('span', { class: 'muted' }, 'Click a visit to see its requests. Nginx logs no session ID, so visits are grouped by user agent and a 30-minute gap.')),
+      visitList
+    ),
+    actions: (close) => [copyButton(() => ip, 'Copy IP'), onFilter && button('Show only this client', () => (close(), onFilter(ip))), button('Close', close, 'primary')].filter(Boolean),
+  });
+}
+
+function topTable(title, rows, total, mono = true, onPick) {
   return h(
     'div',
     { class: 'card traffic-top' },
@@ -65,7 +209,8 @@ function topTable(title, rows, total, mono = true) {
           rows.map((r) => {
             const fill = h('i');
             fill.style.width = `${Math.max(2, (r.count / rows[0].count) * 100)}%`;
-            return h('div', { class: 'top-row', title: `${r.key} — ${r.count} (${pct(r.count, total)})` }, h('span', { class: mono ? 'mono top-key' : 'top-key' }, r.key), h('span', { class: 'top-bar' }, fill), h('b', null, String(r.count)));
+            const key = onPick ? h('button', { type: 'button', class: `link ${mono ? 'mono ' : ''}top-key`, onclick: () => onPick(r.key) }, r.key) : h('span', { class: mono ? 'mono top-key' : 'top-key' }, r.key);
+            return h('div', { class: 'top-row', title: `${r.key} — ${r.count} (${pct(r.count, total)})` }, key, h('span', { class: 'top-bar' }, fill), h('b', null, String(r.count)));
           })
         )
       : h('div', { class: 'muted' }, 'Nothing yet.')
@@ -119,6 +264,7 @@ export function render(root, ctx) {
   let data = null;
   let filter = '';
   let only = 'all';
+  let client = ''; // narrow the request list to one IP, from the client drill-down
   let match = 'site'; // shared log: just this site's lines (grep for its domains), or all of them
 
   async function ownLog(adding) {
@@ -163,6 +309,9 @@ export function render(root, ctx) {
     );
   drawSeg();
 
+  const showClient = (ip, focus) => data && clientDialog(ip, data, { focus, onFilter: (v) => ((client = v), drawRequests()) });
+  const clientChip = h('span');
+
   const notice = h('div');
   const summary = h('div');
   const requests = h('div');
@@ -176,7 +325,11 @@ export function render(root, ctx) {
 
   function drawRequests() {
     if (!data) return;
+    clientChip.replaceChildren(
+      ...(client ? [h('span', { class: 'client-chip' }, 'Client ', h('span', { class: 'mono' }, client), h('button', { type: 'button', class: 'chip-x', title: 'Show all clients', onclick: () => ((client = ''), drawRequests()) }, '×'))] : [])
+    );
     const rows = data.entries.filter((e) => {
+      if (client && e.ip !== client) return false;
       if (only !== 'all' && String(Math.floor(e.status / 100)) !== only) return false;
       if (!filter) return true;
       return `${e.method} ${e.path} ${e.ip} ${e.status} ${e.agent} ${e.referer}`.toLowerCase().includes(filter);
@@ -190,14 +343,14 @@ export function render(root, ctx) {
             'tr',
             null,
             h('td', { class: 'mono muted nowrap', title: e.time ? new Date(e.time).toLocaleString() : '' }, e.time ? (data.now - e.time > 86400000 ? `${day(e.time)} ${clock(e.time)}` : clock(e.time)) : '—'),
-            h('td', { class: 'mono nowrap' }, e.ip, e.user && h('div', { class: 'muted' }, e.user)),
+            h('td', { class: 'mono nowrap' }, h('button', { type: 'button', class: 'link mono', title: `Drill into ${e.ip}`, onclick: () => showClient(e.ip, e) }, e.ip), e.user && h('div', { class: 'muted' }, e.user)),
             h('td', { class: 'mono req-cell', title: `${e.method} ${e.path}${e.referer ? `\nfrom ${e.referer}` : ''}` }, e.method && h('span', { class: 'method' }, e.method), ' ', e.path),
             h('td', null, badge(String(e.status), statusKind(e.status))),
             h('td', { class: 'muted nowrap' }, fmtBytes(e.bytes)),
             h('td', { class: 'muted ua-cell', title: e.agent }, e.agent || '—')
           )
         ),
-        filter || only !== 'all' ? 'No requests match.' : 'No requests in the log yet.',
+        client || filter || only !== 'all' ? 'No requests match.' : 'No requests in the log yet.',
         { fit: true }
       ),
       rows.length > ROWS && h('div', { class: 'hint muted' }, `Showing the latest ${ROWS} of ${rows.length} matching requests.`)
@@ -266,7 +419,7 @@ export function render(root, ctx) {
         stat('Errors', pct(errors, s.total), `${s.classes[4]} 4xx · ${s.classes[5]} 5xx`, s.classes[5] ? 'text-bad' : errors ? 'text-warn' : ''),
         stat('Last request', s.last ? `${fmtDuration(Math.max(0, (d.now - s.last) / 1000))} ago` : '—', s.last ? new Date(s.last).toLocaleString() : 'none in the log')
       ),
-      h('div', { class: 'traffic-grid section-gap' }, h('div', { class: 'card chart-card' }, h('div', { class: 'chart-title' }, 'Requests per minute', h('span', { class: 'muted' }, 'last hour')), rateChart(s.perMinute)), topTable('Top paths', s.topPaths, s.total), topTable('Top clients', s.topIps, s.total))
+      h('div', { class: 'traffic-grid section-gap' }, h('div', { class: 'card chart-card' }, h('div', { class: 'chart-title' }, 'Requests per minute', h('span', { class: 'muted' }, 'last hour')), rateChart(s.perMinute)), topTable('Top paths', s.topPaths, s.total), topTable('Top clients', s.topIps, s.total, true, (ip) => showClient(ip)))
     );
 
     if (body.querySelector('.loading')) {
@@ -276,7 +429,7 @@ export function render(root, ctx) {
         h(
           'div',
           { class: 'section' },
-          h('div', { class: 'section-head' }, h('h2', null, 'Recent requests'), h('span', { class: 'muted mono' }, d.path), h('span', { class: 'spacer' }), seg, search),
+          h('div', { class: 'section-head' }, h('h2', null, 'Recent requests'), h('span', { class: 'muted mono' }, d.path), h('span', { class: 'spacer' }), clientChip, seg, search),
           requests
         )
       );

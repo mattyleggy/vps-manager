@@ -621,6 +621,17 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
       forModel: (r) => ({ ...r, stats: { ...r.stats, perMinute: undefined }, entries: r.entries.slice(0, 40), entriesShown: Math.min(40, r.entries.length) }),
     },
     {
+      id: 'net:reverseDns',
+      description: 'Look up the host names an IP address points back to (reverse DNS / PTR records). Use to identify a client IP seen in nginx_traffic, e.g. a crawler or cloud provider.',
+      input: obj({ ip: str('IPv4 or IPv6 address') }, ['ip']),
+      async run({ ip }) {
+        if (!net.isIP(ip)) throw new Error(`"${ip}" is not an IP address`);
+        if (PRIVATE_IP.test(ip) || ip === '::1' || /^f[cd]/i.test(ip)) return { ip, private: true, names: [] };
+        const names = await dns.reverse(ip).catch(() => []);
+        return { ip, private: false, names };
+      },
+    },
+    {
       id: 'nginx:siteLog',
       change: true,
       description: "Give a site its own access log with a size cap: adds `access_log /var/log/nginx/sites/<name>.access.log;` to each server block of its config that has none (then tests and reloads nginx; the old file is restored if the test fails), and sets up logrotate to rotate it, checked hourly, once it passes maxSizeMb, keeping `keep` old compressed copies. On a site that already has that log, it only changes the cap. Use when nginx_traffic reports shared: true and the user wants per-site traffic, or to change how big a site's log may get.",

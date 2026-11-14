@@ -174,7 +174,7 @@ kbd {
 /* ---------------------------------------------------------------- layout */
 main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 #view { flex: 1; overflow: auto; padding: 28px 32px 48px; container-type: size; }
-#view > div { max-width: 1280px; animation: rise 0.35s var(--ease) both; }
+#view > div { animation: rise 0.35s var(--ease) both; }
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
 
 .crumbs { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12.5px; color: var(--faint); }
@@ -635,7 +635,7 @@ td button.link { color: #c4b8ff; }
 #nav button.nav-pin { padding: 6px 12px 6px 28px; font-size: 12.5px; }
 #nav button.nav-pin .nav-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .page-sub { font-size: 14px; margin-left: -4px; }
-.traffic-stats { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+.traffic-stats { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
 .traffic-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
 @media (max-width: 1250px) { .traffic-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .traffic-grid > :first-child { grid-column: 1 / -1; } }
 .traffic-chart { height: 110px; }
@@ -736,3 +736,23 @@ td.num { text-align: center; width: 90px; }
 tr.repo-detail > td { background: rgba(255, 255, 255, 0.015); padding: 14px 18px 18px; }
 tr.repo-detail:hover > td { background: rgba(255, 255, 255, 0.015); }
 tr.repo-detail .table-wrap { margin-top: 12px; }
+
+/* Traffic: drill into one client IP and its visits. */
+.client-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 6px 4px 10px; border: 1px solid var(--accent-line); background: var(--accent-soft); border-radius: 999px; font-size: 12px; white-space: nowrap; }
+.client-chip .chip-x { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 4px; }
+.client-chip .chip-x:hover { color: var(--text); }
+.top-row button.top-key { color: #c4b8ff; }
+.client-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+.client-drill .traffic-stats { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+.client-drill .req-cell { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.client-drill .ua-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.client-drill .method { color: var(--muted); font-size: 11px; font-weight: 600; }
+.visit-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.visit { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.visit-head { width: 100%; display: grid; grid-template-columns: 44px 120px 90px 140px 90px minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 10px; padding: 9px 12px; background: none; border: 0; color: var(--text); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
+.visit-head:hover, .visit-head[aria-expanded="true"] { background: var(--accent-soft); }
+.visit-id { color: #c4b8ff; }
+.visit-entry { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.visit-detail { border-top: 1px solid var(--line); max-height: 320px; overflow: auto; }
+.visit-detail .table-wrap { border: 0; border-radius: 0; }
+tr.focus-row td { background: var(--accent-soft); }
