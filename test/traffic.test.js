@@ -151,3 +151,70 @@ test('addSiteLog plans the folder, logrotate, hourly cron and config change, and
   await assert.rejects(t.addSiteLog({ name: 'a.com', maxSizeMb: 0 }), /Max size \(MB\) must be a whole number from 1 to 10240/);
   await assert.rejects(t.addSiteLog({ name: 'a.com', keep: 99 }), /Old copies to keep/);
 });
+
+test('isPageLoad keeps page views and drops assets, API calls and non-GETs', () => {
+  const { isPageLoad } = createTraffic;
+  const page = (path, method = 'GET') => isPageLoad({ method, path });
+  for (const p of ['/', '/pricing', '/product/significance-and-x?ref=1', '/about.html', '/index.php', '/blog/', '/statistics', '/building-blocks'])
+    assert.ok(page(p), `${p} is a page`);
+  for (const p of ['/_next/static/chunks/a.js', '/_next/image?url=x', '/robots.txt', '/favicon.ico', '/styles.css?v=2', '/img/logo.png', '/fonts/a.woff2', '/api/users', '/static/x', '/sitemap.xml'])
+    assert.ok(!page(p), `${p} is not a page`);
+  assert.ok(!page('/contact', 'POST'));
+  assert.ok(page('/contact', 'HEAD'));
+  assert.ok(!page('\x16\x03\x01', ''), 'junk request lines are not pages');
+});
+
+test('read() with pages keeps only page loads and reads further back', async () => {
+  let input;
+  const asset = LINE.replace(/"GET \S+/, '"GET /_next/static/a.js');
+  const ssh = {
+    async python(s) {
+      input = JSON.parse(JSON.parse(/IN = json\.loads\((".*")\)/.exec(s)[1]));
+      return { path: '/x.log', format: 'combined', shared: false, others: [], exists: true, size: 1, now: 0, lines: [LINE.replace('/api/items', '/pricing'), LINE, asset] };
+    },
+  };
+  const nginx = { list: async () => ({ sites: [{ name: 'a.com', kind: 'site', path: '/p', content: '', summary: { domains: ['a.com'] } }] }) };
+  const r = await createTraffic(ssh, nginx).read({ name: 'a.com', pages: true });
+  assert.strictEqual(input.lines, 5000);
+  assert.strictEqual(r.pages, true);
+  assert.strictEqual(r.read, 3);
+  assert.strictEqual(r.entries.length, 1);
+  assert.strictEqual(r.stats.total, 1);
+});
+
+test('botName names crawlers, tools and scanners, and leaves browsers alone', () => {
+  const { botName } = createTraffic;
+  const browsers = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+  ];
+  for (const ua of browsers) assert.strictEqual(botName(ua), '', ua);
+  assert.strictEqual(botName('Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'), 'Google');
+  assert.strictEqual(botName('Mozilla/5.0 (compatible; ExaSearchBot/1.0; +https://crawler.exa.ai)'), 'ExaSearchBot');
+  assert.strictEqual(botName('Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0)'), 'Anthropic');
+  assert.strictEqual(botName('curl/8.4.0'), 'curl');
+  assert.strictEqual(botName('python-requests/2.31'), 'Python');
+  assert.strictEqual(botName(''), 'No user agent');
+  assert.strictEqual(botName('-'), 'No user agent');
+  assert.strictEqual(botName('Mozilla/5.0 zgrab/0.x'), 'Scanner');
+  assert.strictEqual(botName('WhatsApp/2.23'), 'WhatsApp', 'non-browser agents are tools');
+  assert.strictEqual(botName('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 (compatible; meta-webindexer/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler))'), 'Meta');
+  assert.strictEqual(botName('Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36 (compatible; NewThingy/2.0)'), 'NewThingy', 'browser string with a compatible tag');
+  assert.strictEqual(botName('Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.1; Trident/6.0)'), '', 'old Internet Explorer is a browser');
+});
+
+test('read() tags bots and can keep only humans or only bots', async () => {
+  const bot = LINE.replace(/"Mozilla[^"]*\\"quoted\\""$/, '"curl/8.0"');
+  const human = LINE.replace(/"Mozilla[^"]*\\"quoted\\""$/, '"Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"');
+  const ssh = { python: async () => ({ path: '/x.log', format: 'combined', shared: false, others: [], exists: true, size: 1, now: 0, lines: [bot, human, human] }) };
+  const nginx = { list: async () => ({ sites: [{ name: 'a.com', kind: 'site', path: '/p', content: '', summary: { domains: ['a.com'] } }] }) };
+  const t = createTraffic(ssh, nginx);
+  const all = await t.read({ name: 'a.com' });
+  assert.deepStrictEqual(all.entries.map((e) => e.bot).sort(), ['', '', 'curl']);
+  assert.strictEqual((await t.read({ name: 'a.com', who: 'humans' })).entries.length, 2);
+  const bots = await t.read({ name: 'a.com', who: 'bots' });
+  assert.strictEqual(bots.entries.length, 1);
+  assert.strictEqual(bots.who, 'bots');
+  assert.strictEqual(bots.read, 3);
+});

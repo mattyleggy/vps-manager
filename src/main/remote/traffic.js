@@ -175,6 +175,75 @@ function parseLine(line) {
   };
 }
 
+// Files a browser fetches while rendering a page (scripts, styles, images, fonts, media, source
+// maps) and framework asset folders. Any other GET/HEAD, whatever its status, counts as a page
+// load: extensionless paths and .html/.php style ones.
+const ASSET_EXT = /\.(m?js|css|map|json|xml|txt|webmanifest|png|jpe?g|gif|svg|webp|avif|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp4|webm|mov|mp3|wav|ogg|flac|pdf|zip|gz|wasm)$/i;
+const ASSET_DIR = /^\/(_next|_nuxt|static|assets|build|dist|wp-content|wp-includes)(\/|$)/i;
+
+/** True when an entry looks like a person loading a page, not the page's assets or an API call. */
+function isPageLoad(e) {
+  if (e.method && e.method !== 'GET' && e.method !== 'HEAD') return false;
+  const path = (e.path || '').split(/[?#]/)[0];
+  if (!path.startsWith('/')) return false;
+  if (ASSET_DIR.test(path) || /^\/api(\/|$)/i.test(path) || ASSET_EXT.test(path)) return false;
+  return true;
+}
+
+// Known automated clients, checked in order: [pattern, name]. The first group are crawlers and
+// link previewers that say who they are; the second, HTTP libraries and scanners.
+const BOTS = [
+  [/Googlebot|Google-InspectionTool|GoogleOther|Storebot-Google|AdsBot-Google|Mediapartners-Google|APIs-Google|Google-Extended|FeedFetcher-Google/i, 'Google'],
+  [/bingbot|BingPreview|msnbot|adidxbot/i, 'Bing'],
+  [/GPTBot|ChatGPT-User|OAI-SearchBot/i, 'OpenAI'],
+  [/ClaudeBot|Claude-User|Claude-SearchBot|anthropic-ai/i, 'Anthropic'],
+  [/PerplexityBot|Perplexity-User/i, 'Perplexity'],
+  [/Applebot/i, 'Apple'],
+  [/facebookexternalhit|facebookcatalog|meta-externalagent|meta-externalfetcher|meta-webindexer|FacebookBot/i, 'Meta'],
+  [/YandexBot|YandexImages|YandexMetrika/i, 'Yandex'],
+  [/Baiduspider/i, 'Baidu'],
+  [/DuckDuckBot|DuckAssistBot/i, 'DuckDuckGo'],
+  [/Bytespider/i, 'ByteDance'],
+  [/Amazonbot/i, 'Amazon'],
+  [/AhrefsBot|AhrefsSiteAudit/i, 'Ahrefs'],
+  [/SemrushBot|SiteAuditBot/i, 'Semrush'],
+  [/Chrome-Lighthouse|Lighthouse/i, 'Lighthouse'],
+  [/HeadlessChrome|PhantomJS|Puppeteer|Playwright|Selenium/i, 'Headless browser'],
+  [/\bcurl\//i, 'curl'],
+  [/\bWget\//i, 'Wget'],
+  [/python-requests|python-urllib|aiohttp|httpx|Python\//i, 'Python'],
+  [/Go-http-client/i, 'Go'],
+  [/\bokhttp|Apache-HttpClient|\bJava\//i, 'Java'],
+  [/node-fetch|undici|axios|got \(|Node\.js/i, 'Node.js'],
+  [/libwww-perl|\bPHP\/|GuzzleHttp|Ruby|Faraday/i, 'Script'],
+  [/zgrab|masscan|Nmap|nuclei|sqlmap|nikto|Censys|Expanse|internet-measurement|Palo Alto|ModatScanner|l9scan|leakix/i, 'Scanner'],
+];
+// Anything else that names itself a bot, crawler or spider: use that product name.
+const SELF_NAMED = /(?<![\w.-])([\w.-]*?(?:bot|crawler|spider|scraper|fetcher|checker|monitor|indexer))(?=[\/;\s)+]|$)/i;
+const GENERIC = /\b(bot|crawl|crawler|spider|slurp|scrap|preview|monitor|uptime|archiver|httpclient|indexer)\b/i;
+// A full browser string with "(compatible; Name/1.0 …)" tacked on is a crawler borrowing a
+// browser's identity (old Internet Explorer also says "compatible; MSIE", which is not a bot).
+const COMPATIBLE = /\(compatible;\s*([A-Za-z][\w.-]*)/i;
+
+/**
+ * The name of the automated client an access-log user agent belongs to, or '' for what looks like
+ * a person's browser. A missing user agent counts as a bot: real browsers always send one.
+ */
+function botName(agent) {
+  const ua = String(agent || '').trim();
+  if (!ua || ua === '-') return 'No user agent';
+  for (const [re, name] of BOTS) if (re.test(ua)) return name;
+  // Product tokens only: a bot named in a URL ("…/webmasters/crawler") is skipped here.
+  const own = SELF_NAMED.exec(ua.replace(/https?:\/\/\S*/gi, ''));
+  if (own && !/^(Mobile|CriOS)$/i.test(own[1])) return own[1];
+  const compat = COMPATIBLE.exec(ua);
+  if (compat && !/^(MSIE|Trident)/i.test(compat[1])) return compat[1];
+  if (GENERIC.test(ua)) return 'Bot';
+  // Real browsers all start with Mozilla/5.0 (or Opera/); anything else is a tool.
+  if (!/^(Mozilla\/5\.0|Opera\/)/.test(ua)) return ua.split(/[\/\s;(]/)[0].slice(0, 40) || 'Bot';
+  return '';
+}
+
 function top(counts, n) {
   return [...counts]
     .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
@@ -266,9 +335,10 @@ module.exports = (ssh, nginx) => {
      * The last `lines` requests of a site, newest first. On a shared log, match 'site' (the
      * default) keeps only lines that name one of the site's domains; 'all' keeps every line.
      */
-    async read({ name, kind = 'site', lines = 1000, match = 'site' }) {
+    async read({ name, kind = 'site', lines, match = 'site', pages = false, who = 'all' }) {
       const site = await findSite(name, kind);
-      const n = Math.min(MAX_LINES, Math.max(1, Math.trunc(Number(lines)) || 1000));
+      // Page loads are a small share of all requests, so read further back for them.
+      const n = Math.min(MAX_LINES, Math.max(1, Math.trunc(Number(lines)) || (pages ? MAX_LINES : 1000)));
       const domains = site.summary.domains.filter((d) => !d.startsWith('*.'));
       const input = { conf: site.path, lines: n, domains, match: match === 'all' ? 'all' : 'site', rotate: rotatePath(name), ownPath: siteLogPath(name) };
       const r = await ssh.python(TAIL_SCRIPT(input), { sudo: true });
@@ -278,6 +348,12 @@ module.exports = (ssh, nginx) => {
         const e = parseLine(l);
         if (e) entries.push(e);
         else unparsed++;
+      }
+      const scannedEntries = entries.length;
+      for (const e of entries) e.bot = botName(e.agent);
+      if (pages || who === 'humans' || who === 'bots') {
+        const keep = entries.filter((e) => (!pages || isPageLoad(e)) && (who === 'humans' ? !e.bot : who === 'bots' ? !!e.bot : true));
+        entries.splice(0, entries.length, ...keep);
       }
       const now = Math.round(r.now * 1000);
       return {
@@ -299,6 +375,10 @@ module.exports = (ssh, nginx) => {
         size: r.size,
         now,
         unparsed,
+        // pages: only page loads were kept, out of `read` parsed log lines.
+        pages: !!pages,
+        who: who === 'humans' || who === 'bots' ? who : 'all',
+        read: scannedEntries,
         sample: unparsed && !entries.length ? r.lines.slice(-3) : [],
         stats: stats(entries, now),
         entries: entries.reverse(),
@@ -329,6 +409,8 @@ module.exports = (ssh, nginx) => {
 module.exports.parseLine = parseLine;
 module.exports.parseTime = parseTime;
 module.exports.stats = stats;
+module.exports.isPageLoad = isPageLoad;
+module.exports.botName = botName;
 module.exports.addSiteLog = addSiteLog;
 module.exports.siteLogPath = siteLogPath;
 module.exports.rotateConfig = rotateConfig;

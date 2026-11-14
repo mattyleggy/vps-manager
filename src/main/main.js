@@ -39,6 +39,7 @@ const vultr = require('./vultr')({ key: () => store.vultrKey() });
 const security = require('./remote/security')(ssh);
 const osv = require('./osv')();
 const traffic = require('./remote/traffic')(ssh, nginx);
+const geoip = require('./geoip')({ file: () => path.join(app.getPath('userData'), 'geoip-cache.json') });
 
 let win = null;
 let tray = null;
@@ -76,7 +77,7 @@ const shellJob = (title, cmd, { read = false, what } = {}) =>
   });
 
 // ---- actions: everything the app can do on the server (see actions.js) ----
-const actions = defineActions({ ssh, store, system, nginx, docker, deploy, github, vultr, activity, detect, security, osv, traffic, shellJob, job });
+const actions = defineActions({ ssh, store, system, nginx, docker, deploy, github, vultr, activity, detect, security, osv, traffic, geoip, shellJob, job });
 const actionsById = new Map(actions.map((a) => [a.id, a]));
 
 // ---- review before apply ----

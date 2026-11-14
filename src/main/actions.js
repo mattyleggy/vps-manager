@@ -94,7 +94,7 @@ function launchInput(a, { hasToken, certEmail }) {
   return L;
 }
 
-module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, activity, detect, security, osv, traffic, shellJob, job }) => {
+module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, activity, detect, security, osv, traffic, geoip, shellJob, job }) => {
   // The last repository scan, so reopening the screen (or the assistant asking) doesn't re-run it.
   let repoScan = null;
 
@@ -612,8 +612,10 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
         {
           name: str('Config file name, as returned by nginx_list'),
           kind: SITE_KIND,
-          lines: { type: 'integer', description: 'How many of the most recent matching log lines to read (default 1000, max 5000)' },
+          lines: { type: 'integer', description: 'How many of the most recent matching log lines to read (default 1000, or 5000 with pages; max 5000)' },
           match: { type: 'string', enum: ['site', 'all'], description: 'Only for a site on the shared log: "site" (default) keeps lines naming one of its domains, "all" keeps every line of the shared log' },
+          pages: { type: 'boolean', description: 'Keep only page loads (GET/HEAD of extensionless or .html/.php paths), dropping scripts, styles, images, fonts, framework assets and /api calls. Reads up to 5000 lines when set. Use when the user asks about visitors or which pages are viewed.' },
+          who: { type: 'string', enum: ['all', 'humans', 'bots'], description: 'Keep every client (default), only browsers that look like people, or only bots (crawlers, link previewers, HTTP libraries, scanners, empty user agents). Each entry carries bot: the bot name, or "" for a person.' },
         },
         ['name']
       ),
@@ -630,6 +632,12 @@ module.exports = ({ ssh, store, system, nginx, docker, deploy, github, vultr, ac
         const names = await dns.reverse(ip).catch(() => []);
         return { ip, private: false, names };
       },
+    },
+    {
+      id: 'net:geo',
+      description: 'Country, city and network (ISP, AS, whether it is a hosting/datacenter or proxy address) of client IPs, e.g. from nginx_traffic. Looked up with ip-api.com and cached for 30 days; private addresses are not looked up. IPs missing from the result could not be looked up right now (rate limit or offline).',
+      input: obj({ ips: { type: 'array', items: { type: 'string' }, maxItems: 500, description: 'IPv4 or IPv6 addresses' } }, ['ips']),
+      run: ({ ips }) => geoip.lookup(ips),
     },
     {
       id: 'nginx:siteLog',

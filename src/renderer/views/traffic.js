@@ -58,6 +58,54 @@ function rateChart({ start, values }) {
 const VISIT_GAP_MS = 30 * 60000;
 const PRIVATE_IP = /^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|::1$|f[cd])/i;
 
+// Country of each client IP, shared by every Traffic page and filled in by net:geo (which caches
+// on disk). Flags are flag-icons' SVGs; Windows has no emoji flags, so text is the fallback.
+const geo = new Map(); // ip -> { cc, country, city, isp, org, as, hosting, proxy } | { private: true }
+const geoAsked = new Map(); // ip -> when it was asked for, so a failed lookup is retried a minute later
+const FLAGS = new URL('../../../node_modules/flag-icons/flags/4x3/', import.meta.url).href;
+
+/** The client's flag (or a text stand-in), with the place as its tooltip. */
+function flag(ip) {
+  const g = geo.get(ip);
+  if (!g) return h('span', { class: 'flag' });
+  if (g.private) return h('span', { class: 'flag flag-text', title: 'Private network address' }, 'LAN');
+  if (!g.cc) return h('span', { class: 'flag', title: 'Location unknown' });
+  const title = [g.city, g.country].filter(Boolean).join(', ');
+  const img = h('img', { class: 'flag', src: `${FLAGS}${g.cc}.svg`, alt: g.cc.toUpperCase(), title });
+  img.addEventListener('error', () => img.replaceWith(h('span', { class: 'flag flag-text', title }, g.cc.toUpperCase())), { once: true });
+  return img;
+}
+
+/** Look up the IPs not known yet. Resolves true when something new came back. */
+async function lookupGeo(ips) {
+  const now = Date.now();
+  const want = [...new Set(ips)].filter((ip) => !geo.has(ip) && now - (geoAsked.get(ip) || 0) > 60000).slice(0, 300);
+  if (!want.length) return false;
+  want.forEach((ip) => geoAsked.set(ip, now));
+  const r = await api('net:geo', { ips: want }).catch(() => ({}));
+  for (const [ip, v] of Object.entries(r)) geo.set(ip, v);
+  return Object.keys(r).length > 0;
+}
+
+const botBadge = (name) => name && h('span', { class: 'bot-badge', title: name === 'No user agent' ? 'Sent no user agent, which real browsers always do' : `Automated client: ${name}` }, name === 'No user agent' ? 'No UA' : name);
+
+/** User agent cell: the bot's name as a badge, then the raw string. */
+const agentCell = (e) => h('td', { class: 'muted ua-cell', title: e.agent || 'No user agent' }, botBadge(e.bot), e.agent || (e.bot ? '' : '—'));
+
+/** Referrer cell: links from the site itself show just the path (dimmed), others the host and path. */
+function refCell(ref, domains = []) {
+  if (!ref) return h('td', { class: 'muted ref-cell' }, '—');
+  let u = null;
+  try {
+    u = new URL(ref);
+  } catch {}
+  if (!u) return h('td', { class: 'ref-cell', title: ref }, ref);
+  const host = u.hostname.replace(/^www\./, '');
+  const own = domains.some((d) => d.replace(/^www\./, '') === host);
+  const rest = u.pathname === '/' && !u.search ? '' : u.pathname + u.search;
+  return h('td', { class: `ref-cell ${own ? 'muted' : 'ref-ext'}`, title: own ? `${ref}\n(from this site)` : ref }, own ? rest || '/' : host + rest);
+}
+
 /** One client's entries (any order) -> visits, newest first, each with its requests oldest first. */
 function visitsOf(entries) {
   const sorted = [...entries].sort((a, b) => (a.time || 0) - (b.time || 0));
@@ -100,6 +148,26 @@ function clientDialog(ip, data, { focus, onFilter } = {}) {
   const errors = mine.filter((e) => e.status >= 400).length;
   const bytes = mine.reduce((n, e) => n + e.bytes, 0);
 
+  const place = h('div', { class: 'client-place' });
+  const drawPlace = () => {
+    const g = geo.get(ip);
+    if (!g) return place.replaceChildren(h('span', { class: 'muted' }, 'Looking up location…'));
+    if (g.private) return place.replaceChildren();
+    place.replaceChildren(
+      flag(ip),
+      h('span', null, [g.city, g.country].filter(Boolean).join(', ') || 'Location unknown'),
+      (g.org || g.isp) && h('span', { class: 'muted' }, `· ${g.org || g.isp}`),
+      g.as && h('span', { class: 'muted mono' }, `· ${g.as.split(' ')[0]}`),
+      g.hosting && h('span', { class: 'bot-badge', title: 'This address belongs to a hosting or datacenter network, where crawlers and scripts usually run, not home or mobile internet' }, 'Datacenter'),
+      g.proxy && h('span', { class: 'bot-badge', title: 'Known proxy, VPN or Tor exit' }, 'Proxy / VPN')
+    );
+  };
+  drawPlace();
+  if (!geo.has(ip)) lookupGeo([ip]).then(drawPlace);
+  const bots = countBy(mine.filter((e) => e.bot), (e) => e.bot);
+  const who = bots.length
+    ? h('div', { class: 'client-place' }, h('span', null, bots.length === 1 && bots[0].count === mine.length ? 'Bot:' : 'Bots among its requests:'), ...bots.map((b) => botBadge(b.key)))
+    : h('div', { class: 'client-place muted' }, "Its user agents look like a person's browser.");
   const host = h('span', { class: 'muted' }, 'Looking up host name…');
   if (PRIVATE_IP.test(ip)) {
     host.replaceChildren('Private network address: usually a proxy, load balancer or container in front of nginx, so the real visitor IP is not in this log.');
@@ -127,7 +195,7 @@ function clientDialog(ip, data, { focus, onFilter } = {}) {
 
   const requestRows = (reqs) =>
     table(
-      ['Time', 'Request', 'Status', 'Size', 'Referer'],
+      ['Time', 'Request', 'Status', 'Referrer'],
       [...reqs].reverse().map((e) =>
         h(
           'tr',
@@ -135,8 +203,7 @@ function clientDialog(ip, data, { focus, onFilter } = {}) {
           h('td', { class: 'mono muted nowrap' }, when(e.time, now)),
           h('td', { class: 'mono req-cell', title: `${e.method} ${e.path}` }, e.method && h('span', { class: 'method' }, e.method), ' ', e.path),
           h('td', null, badge(String(e.status), statusKind(e.status))),
-          h('td', { class: 'muted nowrap' }, fmtBytes(e.bytes)),
-          h('td', { class: 'muted ua-cell', title: e.referer }, e.referer || '—')
+          refCell(e.referer, data.domains)
         )
       ),
       'No requests.',
@@ -159,7 +226,7 @@ function clientDialog(ip, data, { focus, onFilter } = {}) {
         h('span', { class: 'nowrap' }, `${v.requests.length} req · ${pages} path${pages === 1 ? '' : 's'}`),
         errs ? badge(`${errs} error${errs === 1 ? '' : 's'}`, 'warn') : h('span'),
         h('span', { class: 'mono muted visit-entry', title: v.requests[0].path }, v.requests[0].path),
-        h('span', { class: 'muted ua-cell', title: v.agent }, v.agent || '—')
+        h('span', { class: 'muted ua-cell', title: v.agent }, botBadge(v.requests[0].bot), v.agent || '')
       );
       const toggle = (open) => {
         if (open && !detail.firstChild) detail.append(requestRows(v.requests));
@@ -173,23 +240,25 @@ function clientDialog(ip, data, { focus, onFilter } = {}) {
   );
 
   modal({
-    title: h('span', null, 'Client ', h('span', { class: 'mono' }, ip)),
+    title: h('span', { class: 'client-title' }, 'Client ', flag(ip), h('span', { class: 'mono' }, ip)),
     wide: true,
     body: h(
       'div',
       { class: 'client-drill' },
+      place,
+      who,
       h('div', { class: 'field' }, host),
       h(
         'div',
         { class: 'grid traffic-stats' },
-        stat('Requests', String(mine.length), `${pct(mine.length, data.entries.length)} of the loaded log`),
+        stat('Requests', String(mine.length), `${pct(mine.length, data.entries.length)} of the loaded ${data.pages ? 'page loads' : 'log'}`),
         stat('Visits', String(visits.length), 'no gap over 30 min'),
         stat('Errors', pct(errors, mine.length), `${errors} 4xx/5xx`, errors ? 'text-warn' : ''),
         stat('Data sent', fmtBytes(bytes), ''),
         stat('First seen', times.length ? when(Math.min(...times), now) : '—', ''),
         stat('Last seen', times.length ? `${fmtDuration(Math.max(0, (now - Math.max(...times)) / 1000))} ago` : '—', '')
       ),
-      h('div', { class: 'client-grid section-gap' }, list('User agents', countBy(mine, (e) => e.agent), false), list('Paths', countBy(mine, (e) => e.path.split('?')[0]), true)),
+      h('div', { class: 'client-grid section-gap' }, list('User agents', countBy(mine, (e) => (e.bot ? `[${e.bot}] ` : '') + (e.agent || '')), false), list('Paths', countBy(mine, (e) => e.path.split('?')[0]), true)),
       h('div', { class: 'section-head section-gap' }, h('h2', null, 'Visits'), h('span', { class: 'muted' }, 'Click a visit to see its requests. Nginx logs no session ID, so visits are grouped by user agent and a 30-minute gap.')),
       visitList
     ),
@@ -209,7 +278,9 @@ function topTable(title, rows, total, mono = true, onPick) {
           rows.map((r) => {
             const fill = h('i');
             fill.style.width = `${Math.max(2, (r.count / rows[0].count) * 100)}%`;
-            const key = onPick ? h('button', { type: 'button', class: `link ${mono ? 'mono ' : ''}top-key`, onclick: () => onPick(r.key) }, r.key) : h('span', { class: mono ? 'mono top-key' : 'top-key' }, r.key);
+            const key = onPick
+              ? h('span', { class: 'top-key top-client' }, flag(r.key), h('button', { type: 'button', class: `link ${mono ? 'mono ' : ''}top-key`, onclick: () => onPick(r.key) }, r.key))
+              : h('span', { class: mono ? 'mono top-key' : 'top-key' }, r.key);
             return h('div', { class: 'top-row', title: `${r.key} — ${r.count} (${pct(r.count, total)})` }, key, h('span', { class: 'top-bar' }, fill), h('b', null, String(r.count)));
           })
         )
@@ -265,6 +336,14 @@ export function render(root, ctx) {
   let filter = '';
   let only = 'all';
   let client = ''; // narrow the request list to one IP, from the client drill-down
+  let pages = false; // just page loads, not the scripts, styles and images they pull in
+  try {
+    pages = localStorage.getItem('traffic.pages') === '1';
+  } catch {}
+  let who = 'all'; // every client, only people's browsers, or only bots
+  try {
+    who = localStorage.getItem('traffic.who') || 'all';
+  } catch {}
   let match = 'site'; // shared log: just this site's lines (grep for its domains), or all of them
 
   async function ownLog(adding) {
@@ -298,7 +377,41 @@ export function render(root, ctx) {
     } else tick();
   });
 
-  const search = h('input', { type: 'search', class: 'traffic-search', placeholder: 'Filter by path, IP, method, user agent…', spellcheck: 'false' });
+  const kindSeg = h('div', { class: 'seg', title: 'Page loads leaves out scripts, styles, images, fonts, framework assets (/_next/ and the like) and /api calls' });
+  const drawKind = () =>
+    kindSeg.replaceChildren(
+      ...[[false, 'All requests'], [true, 'Page loads']].map(([v, label]) =>
+        h('button', { type: 'button', class: v === pages ? 'on' : '', onclick: () => {
+          if (pages === v) return;
+          pages = v;
+          try {
+            localStorage.setItem('traffic.pages', v ? '1' : '0');
+          } catch {}
+          drawKind();
+          tick();
+        } }, label)
+      )
+    );
+  drawKind();
+
+  const whoSeg = h('div', { class: 'seg', title: 'Bots are told apart by user agent: crawlers, link previews, HTTP libraries, scanners and requests with no user agent' });
+  const drawWho = () =>
+    whoSeg.replaceChildren(
+      ...[['all', 'Everyone'], ['humans', 'Humans'], ['bots', 'Bots']].map(([v, label]) =>
+        h('button', { type: 'button', class: v === who ? 'on' : '', onclick: () => {
+          if (who === v) return;
+          who = v;
+          try {
+            localStorage.setItem('traffic.who', v);
+          } catch {}
+          drawWho();
+          tick();
+        } }, label)
+      )
+    );
+  drawWho();
+
+  const search =h('input', { type: 'search', class: 'traffic-search', placeholder: 'Filter by path, IP, country, user agent, bot…', spellcheck: 'false' });
   search.addEventListener('input', () => ((filter = search.value.trim().toLowerCase()), drawRequests()));
   const seg = h('div', { class: 'seg' });
   const drawSeg = () =>
@@ -319,7 +432,7 @@ export function render(root, ctx) {
 
   root.append(
     breadcrumbs([['Sites', () => ctx.go('domains')], [name, () => ctx.go('site', false, { name, kind })], ['Traffic']]),
-    h('div', { class: 'page-head' }, h('h1', null, name), h('span', { class: 'muted page-sub' }, 'Traffic'), h('span', { class: 'spacer' }), status, pauseBtn, button('Refresh', () => tick()), button('Edit config', () => ctx.go('site', false, { name, kind })), pinBtn),
+    h('div', { class: 'page-head' }, h('h1', null, name), h('span', { class: 'muted page-sub' }, 'Traffic'), h('span', { class: 'spacer' }), whoSeg, kindSeg, status, pauseBtn, button('Refresh', () => tick()), button('Edit config', () => ctx.go('site', false, { name, kind })), pinBtn),
     body
   );
 
@@ -332,22 +445,23 @@ export function render(root, ctx) {
       if (client && e.ip !== client) return false;
       if (only !== 'all' && String(Math.floor(e.status / 100)) !== only) return false;
       if (!filter) return true;
-      return `${e.method} ${e.path} ${e.ip} ${e.status} ${e.agent} ${e.referer}`.toLowerCase().includes(filter);
+      const g = geo.get(e.ip);
+      return `${e.method} ${e.path} ${e.ip} ${e.status} ${e.agent} ${e.referer} ${e.bot} ${g ? `${g.country} ${g.cc}` : ''}`.toLowerCase().includes(filter);
     });
     const shown = rows.slice(0, ROWS);
     requests.replaceChildren(
       table(
-        ['Time', 'Client', 'Request', 'Status', 'Size', 'User agent'],
+        ['Time', 'Client', 'Request', 'Status', 'Referrer', 'User agent'],
         shown.map((e) =>
           h(
             'tr',
             null,
             h('td', { class: 'mono muted nowrap', title: e.time ? new Date(e.time).toLocaleString() : '' }, e.time ? (data.now - e.time > 86400000 ? `${day(e.time)} ${clock(e.time)}` : clock(e.time)) : '—'),
-            h('td', { class: 'mono nowrap' }, h('button', { type: 'button', class: 'link mono', title: `Drill into ${e.ip}`, onclick: () => showClient(e.ip, e) }, e.ip), e.user && h('div', { class: 'muted' }, e.user)),
+            h('td', { class: 'mono nowrap client-cell' }, flag(e.ip), h('button', { type: 'button', class: 'link mono', title: `Drill into ${e.ip}`, onclick: () => showClient(e.ip, e) }, e.ip), e.user && h('div', { class: 'muted' }, e.user)),
             h('td', { class: 'mono req-cell', title: `${e.method} ${e.path}${e.referer ? `\nfrom ${e.referer}` : ''}` }, e.method && h('span', { class: 'method' }, e.method), ' ', e.path),
             h('td', null, badge(String(e.status), statusKind(e.status))),
-            h('td', { class: 'muted nowrap' }, fmtBytes(e.bytes)),
-            h('td', { class: 'muted ua-cell', title: e.agent }, e.agent || '—')
+            refCell(e.referer, data.domains),
+            agentCell(e)
           )
         ),
         client || filter || only !== 'all' ? 'No requests match.' : 'No requests in the log yet.',
@@ -413,13 +527,15 @@ export function render(root, ctx) {
         'div',
         { class: 'grid traffic-stats' },
         stat('Requests / min', s.perMinuteNow < 10 ? s.perMinuteNow.toFixed(1) : String(Math.round(s.perMinuteNow)), 'average, last 5 minutes'),
-        stat('Requests', String(s.total), `last ${span} · ${fmtBytes(s.bytes)} sent`),
+        d.pages || d.who !== 'all'
+          ? stat(`${d.who === 'bots' ? 'Bot ' : d.who === 'humans' ? 'Human ' : ''}${d.pages ? 'page loads' : 'requests'}`, String(s.total), `of ${d.read} requests · last ${span}`)
+          : stat('Requests', String(s.total), `last ${span} · ${fmtBytes(s.bytes)} sent`),
         stat('Visitors', String(s.uniqueIps), 'unique client IPs'),
         stat('Success', pct(s.classes[2] + s.classes[3], s.total), `${s.classes[2]} 2xx · ${s.classes[3]} 3xx`, 'text-ok'),
         stat('Errors', pct(errors, s.total), `${s.classes[4]} 4xx · ${s.classes[5]} 5xx`, s.classes[5] ? 'text-bad' : errors ? 'text-warn' : ''),
         stat('Last request', s.last ? `${fmtDuration(Math.max(0, (d.now - s.last) / 1000))} ago` : '—', s.last ? new Date(s.last).toLocaleString() : 'none in the log')
       ),
-      h('div', { class: 'traffic-grid section-gap' }, h('div', { class: 'card chart-card' }, h('div', { class: 'chart-title' }, 'Requests per minute', h('span', { class: 'muted' }, 'last hour')), rateChart(s.perMinute)), topTable('Top paths', s.topPaths, s.total), topTable('Top clients', s.topIps, s.total, true, (ip) => showClient(ip)))
+      h('div', { class: 'traffic-grid section-gap' }, h('div', { class: 'card chart-card' }, h('div', { class: 'chart-title' }, d.pages ? 'Page loads per minute' : 'Requests per minute', h('span', { class: 'muted' }, 'last hour')), rateChart(s.perMinute)), topTable(d.pages ? 'Top pages' : 'Top paths', s.topPaths, s.total), topTable('Top clients', s.topIps, s.total, true, (ip) => showClient(ip)))
     );
 
     if (body.querySelector('.loading')) {
@@ -435,17 +551,23 @@ export function render(root, ctx) {
       );
     }
     drawRequests();
+    // Flags for the clients on screen; redraw once they arrive (later draws find them cached).
+    const ips = [...s.topIps.map((r) => r.key), ...d.entries.map((e) => e.ip)];
+    lookupGeo(ips).then((added) => added && data === d && root.isConnected && draw(d));
   }
 
+  let again = false; // settings changed while a read was in flight: read again once it lands
   async function tick() {
     clearTimeout(timer);
-    if (!root.isConnected || busy) return;
+    if (!root.isConnected) return;
+    if (busy) return void (again = true);
     busy = true;
+    again = false;
     try {
-      const d = await api('nginx:traffic', { name, kind, match });
+      const d = await api('nginx:traffic', { name, kind, match, pages, who });
       if (!root.isConnected) return;
-      draw(d);
-      if (!paused) status.replaceChildren(h('span', { class: 'dot ok' }), `Live · ${new Date().toLocaleTimeString()}`);
+      if (!again) draw(d);
+      if (!paused && !again) status.replaceChildren(h('span', { class: 'dot ok' }), `Live · ${new Date().toLocaleTimeString()}`);
     } catch (e) {
       if (!root.isConnected) return;
       status.replaceChildren(h('span', { class: 'dot bad' }), 'Update failed');
@@ -462,6 +584,7 @@ export function render(root, ctx) {
     } finally {
       busy = false;
     }
+    if (again) return tick();
     if (root.isConnected && !paused) timer = setTimeout(tick, POLL_MS);
   }
   ctx.onLeave(() => clearTimeout(timer));

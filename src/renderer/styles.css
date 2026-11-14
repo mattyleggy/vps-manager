@@ -753,6 +753,23 @@ tr.repo-detail .table-wrap { margin-top: 12px; }
 .visit-head:hover, .visit-head[aria-expanded="true"] { background: var(--accent-soft); }
 .visit-id { color: #c4b8ff; }
 .visit-entry { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.visit-detail { border-top: 1px solid var(--line); max-height: 320px; overflow: auto; }
+.visit-detail { border-top: 1px solid var(--line); }
 .visit-detail .table-wrap { border: 0; border-radius: 0; }
+.visit-detail .table-wrap.fit { max-height: 320px; }
 tr.focus-row td { background: var(--accent-soft); }
+.top-row button.top-key.mono { font-family: var(--mono); font-size: 12px; }
+
+/* Traffic: client flags, bot badges and referrers. */
+.flag { display: inline-block; width: 18px; height: 13.5px; margin-right: 7px; vertical-align: -2px; flex: none; border-radius: 2px; object-fit: cover; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08); }
+span.flag:not(.flag-text) { box-shadow: none; }
+.flag-text { width: auto; min-width: 18px; height: auto; padding: 0 3px; font: 600 9.5px/13.5px var(--sans); letter-spacing: 0.3px; text-align: center; color: var(--muted); background: rgba(255, 255, 255, 0.06); box-shadow: none; vertical-align: 0; }
+.top-client { display: flex; align-items: center; min-width: 0; }
+.top-client .flag { margin-right: 8px; }
+.client-title { display: inline-flex; align-items: center; gap: 2px; }
+.client-title .flag { width: 22px; height: 16.5px; margin: 0 6px 0 4px; }
+.client-place { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; font-size: 13px; }
+.client-place .flag { margin-right: 2px; }
+.bot-badge { display: inline-block; margin-right: 6px; padding: 1px 7px; border-radius: 999px; font: 600 10.5px/16px var(--sans); color: #f5c76b; background: rgba(245, 199, 107, 0.12); border: 1px solid rgba(245, 199, 107, 0.28); white-space: nowrap; vertical-align: 1px; }
+.client-place .bot-badge { margin-right: 0; }
+.traffic-page .ref-cell, .client-drill .ref-cell { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.ref-ext { color: #c4b8ff; }
