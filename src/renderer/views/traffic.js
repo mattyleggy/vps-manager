@@ -449,13 +449,31 @@ export function render(root, ctx) {
       return `${e.method} ${e.path} ${e.ip} ${e.status} ${e.agent} ${e.referer} ${e.bot} ${g ? `${g.country} ${g.cc}` : ''}`.toLowerCase().includes(filter);
     });
     const shown = rows.slice(0, ROWS);
+    // Keep the reader's place: remember the first row in view and where it sat, rebuild, then
+    // scroll so that row is back in the same spot. At the very top, stay there to see new rows.
+    const keys = new Map();
+    const keyOf = (e) => {
+      const k = `${e.time}|${e.ip}|${e.method}|${e.path}|${e.status}|${e.agent}`;
+      const n = (keys.get(k) || 0) + 1;
+      keys.set(k, n);
+      return `${k}#${n}`;
+    };
+    const view = root.closest('#view') || document.scrollingElement;
+    const viewTop = view ? view.scrollTop : 0;
+    const oldWrap = requests.querySelector('.table-wrap');
+    let anchor = null;
+    if (oldWrap && oldWrap.scrollTop > 0) {
+      const top = oldWrap.getBoundingClientRect().top + (oldWrap.querySelector('thead')?.offsetHeight || 0);
+      const row = [...oldWrap.querySelectorAll('tbody tr')].find((tr) => tr.getBoundingClientRect().bottom > top + 1);
+      if (row) anchor = { key: row.dataset.key, offset: row.getBoundingClientRect().top - oldWrap.getBoundingClientRect().top, scrollTop: oldWrap.scrollTop };
+    }
     requests.replaceChildren(
       table(
         ['Time', 'Client', 'Request', 'Status', 'Referrer', 'User agent'],
         shown.map((e) =>
           h(
             'tr',
-            null,
+            { 'data-key': keyOf(e) },
             h('td', { class: 'mono muted nowrap', title: e.time ? new Date(e.time).toLocaleString() : '' }, e.time ? (data.now - e.time > 86400000 ? `${day(e.time)} ${clock(e.time)}` : clock(e.time)) : '—'),
             h('td', { class: 'mono nowrap client-cell' }, flag(e.ip), h('button', { type: 'button', class: 'link mono', title: `Drill into ${e.ip}`, onclick: () => showClient(e.ip, e) }, e.ip), e.user && h('div', { class: 'muted' }, e.user)),
             h('td', { class: 'mono req-cell', title: `${e.method} ${e.path}${e.referer ? `\nfrom ${e.referer}` : ''}` }, e.method && h('span', { class: 'method' }, e.method), ' ', e.path),
@@ -469,6 +487,13 @@ export function render(root, ctx) {
       ),
       rows.length > ROWS && h('div', { class: 'hint muted' }, `Showing the latest ${ROWS} of ${rows.length} matching requests.`)
     );
+    const wrap = requests.querySelector('.table-wrap');
+    if (wrap && anchor) {
+      const row = [...wrap.querySelectorAll('tbody tr')].find((tr) => tr.dataset.key === anchor.key);
+      if (row) wrap.scrollTop += row.getBoundingClientRect().top - wrap.getBoundingClientRect().top - anchor.offset;
+      else wrap.scrollTop = anchor.scrollTop; // that row fell out of the list: keep the same distance
+    }
+    if (view && view.scrollTop !== viewTop) view.scrollTop = viewTop;
   }
 
   function draw(d) {
